@@ -244,6 +244,7 @@ cfg_if! {
 				fn use_trie() -> u64;
 				fn benchmark_indirect_call() -> u64;
 				fn benchmark_direct_call() -> u64;
+				fn returns_mutable_static() -> u64;
 				/// Returns the initialized block number.
 				fn get_block_number() -> u64;
 				/// Takes and returns the initialized block number.
@@ -275,6 +276,7 @@ cfg_if! {
 				fn use_trie() -> u64;
 				fn benchmark_indirect_call() -> u64;
 				fn benchmark_direct_call() -> u64;
+				fn returns_mutable_static() -> u64;
 				/// Returns the initialized block number.
 				fn get_block_number() -> u64;
 				/// Takes and returns the initialized block number.
@@ -336,6 +338,10 @@ fn code_using_trie() -> u64 {
 	}
 	iter_pairs.len() as u64
 }
+
+/// Mutable static variables should be always observed to have
+/// the initialized value at the start of a runtime call.
+static mut MUTABLE_STATIC: u64 = 32;
 
 cfg_if! {
 	if #[cfg(feature = "std")] {
@@ -440,6 +446,13 @@ cfg_if! {
 				}
 				fn benchmark_direct_call() -> u64 {
 					(0..1000).fold(0, |p, i| p + benchmark_add_one(i))
+				}
+
+                fn returns_mutable_static() -> u64 {
+					unsafe {
+						MUTABLE_STATIC += 1;
+						MUTABLE_STATIC
+					}
 				}
 
 				fn get_block_number() -> u64 {
@@ -588,6 +601,13 @@ cfg_if! {
 
 				fn benchmark_direct_call() -> u64 {
 					(0..10000).fold(0, |p, i| p + benchmark_add_one(i))
+				}
+
+                fn returns_mutable_static() -> u64 {
+					unsafe {
+						MUTABLE_STATIC += 1;
+						MUTABLE_STATIC
+					}
 				}
 
 				fn get_block_number() -> u64 {
