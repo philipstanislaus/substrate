@@ -216,7 +216,8 @@ pub struct RawTombstoneContractInfo<H, Hasher>(H, PhantomData<Hasher>);
 
 impl<H, Hasher> RawTombstoneContractInfo<H, Hasher>
 where
-	H: Member + MaybeSerializeDebug + AsRef<[u8]> + AsMut<[u8]> + Copy + Default + rstd::hash::Hash,
+	H: Member + MaybeSerializeDebug + AsRef<[u8]> + AsMut<[u8]> + Copy + Default + rstd::hash::Hash
+		+ Codec,
 	Hasher: Hash<Output=H>,
 {
 	fn new(storage_root: &[u8], code_hash: H) -> Self {
@@ -506,10 +507,10 @@ decl_module! {
 		fn claim_surcharge(origin, dest: T::AccountId, aux_sender: Option<T::AccountId>) {
 			let origin = origin.into();
 			let (signed, rewarded) = match origin {
-				Some(system::RawOrigin::Signed(ref account)) if aux_sender.is_none() => {
+				Ok(system::RawOrigin::Signed(ref account)) if aux_sender.is_none() => {
 					(true, account)
 				},
-				Some(system::RawOrigin::None) if aux_sender.is_some() => {
+				Ok(system::RawOrigin::None) if aux_sender.is_some() => {
 					(false, aux_sender.as_ref().expect("checked above"))
 				},
 				_ => return Err("Invalid surcharge claim: origin must be signed or \

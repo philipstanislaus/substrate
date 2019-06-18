@@ -25,24 +25,16 @@
 //! instantiated. The `BasicQueue` and `BasicVerifier` traits allow serial
 //! queues to be instantiated simply.
 
-use crate::block_import::{
+use std::{sync::Arc, thread, collections::HashMap};
+use crossbeam_channel::{self as channel, Receiver, Sender};
+use parking_lot::Mutex;
+use runtime_primitives::{Justification, traits::{
+	Block as BlockT, Header as HeaderT, NumberFor,
+}};
+use crate::{error::Error as ConsensusError, well_known_cache_keys::Id as CacheKeyId, block_import::{
 	BlockImport, BlockOrigin, ImportBlock, ImportedAux, ImportResult, JustificationImport,
 	FinalityProofImport, FinalityProofRequestBuilder,
-};
-use crossbeam_channel::{self as channel, Receiver, Sender};
-use parity_codec::Encode;
-use parking_lot::Mutex;
-
-use std::sync::Arc;
-use std::thread;
-
-use runtime_primitives::traits::{
-	AuthorityIdFor, Block as BlockT, Header as HeaderT, NumberFor, Digest,
-};
-use runtime_primitives::Justification;
-
-use crate::error::Error as ConsensusError;
-use parity_codec::alloc::collections::hash_map::HashMap;
+}};
 
 /// Reputation change for peers which send us a block with an incomplete header.
 const INCOMPLETE_HEADER_REPUTATION_CHANGE: i32 = -(1 << 20);
@@ -94,7 +86,7 @@ pub trait Verifier<B: BlockT>: Send + Sync {
 		header: B::Header,
 		justification: Option<Justification>,
 		body: Option<Vec<B::Extrinsic>>,
-	) -> Result<(ImportBlock<B>, Option<Vec<AuthorityIdFor<B>>>), String>;
+	) -> Result<(ImportBlock<B>, Option<Vec<(CacheKeyId, Vec<u8>)>>), String>;
 }
 
 /// Blocks import queue API.
@@ -103,7 +95,7 @@ pub trait ImportQueue<B: BlockT>: Send + Sync {
 	///
 	/// This is called automatically by the network service when synchronization
 	/// begins.
-	fn start(&self, _link: Box<Link<B>>) -> Result<(), std::io::Error> {
+	fn start(&self, _link: Box<dyn Link<B>>) -> Result<(), std::io::Error> {
 		Ok(())
 	}
 	/// Import bunch of blocks.
@@ -120,7 +112,7 @@ pub struct BasicSyncQueue<B: BlockT, V: Verifier<B>> {
 }
 
 struct BasicSyncQueueData<B: BlockT, V: Verifier<B>> {
-	link: Mutex<Option<Box<Link<B>>>>,
+	link: Mutex<Option<Box<dyn Link<B>>>>,
 	block_import: SharedBlockImport<B>,
 	verifier: Arc<V>,
 	justification_import: Option<SharedJustificationImport<B>>,
@@ -147,7 +139,7 @@ impl<B: BlockT, V: Verifier<B>> BasicSyncQueue<B, V> {
 }
 
 impl<B: BlockT, V: 'static + Verifier<B>> ImportQueue<B> for BasicSyncQueue<B, V> {
-	fn start(&self, link: Box<Link<B>>) -> Result<(), std::io::Error> {
+	fn start(&self, link: Box<dyn Link<B>>) -> Result<(), std::io::Error> {
 		if let Some(justification_import) = self.data.justification_import.as_ref() {
 			justification_import.on_start(&*link);
 		}
@@ -287,7 +279,7 @@ impl<B: BlockT> BasicQueue<B> {
 }
 
 impl<B: BlockT> ImportQueue<B> for BasicQueue<B> {
-	fn start(&self, link: Box<Link<B>>) -> Result<(), std::io::Error> {
+	fn start(&self, link: Box<dyn Link<B>>) -> Result<(), std::io::Error> {
 		let connect_err = || Err(std::io::Error::new(
 			std::io::ErrorKind::Other,
 			"Failed to connect import queue threads",
@@ -328,7 +320,7 @@ pub enum BlockImportMsg<B: BlockT> {
 	ImportBlocks(BlockOrigin, Vec<IncomingBlock<B>>),
 	ImportJustification(Origin, B::Hash, NumberFor<B>, Justification),
 	ImportFinalityProof(Origin, B::Hash, NumberFor<B>, Vec<u8>),
-	Start(Box<Link<B>>, Sender<Result<(), std::io::Error>>),
+	Start(Box<dyn Link<B>>, Sender<Result<(), std::io::Error>>),
 	Shutdown(Sender<()>),
 	#[cfg(any(test, feature = "test-helpers"))]
 	Synchronize,
@@ -360,7 +352,7 @@ struct BlockImporter<B: BlockT> {
 	result_port: Receiver<BlockImportWorkerMsg<B>>,
 	worker_sender: Option<Sender<BlockImportWorkerMsg<B>>>,
 	link: Option<Box<dyn Link<B>>>,
-	verifier: Arc<Verifier<B>>,
+	verifier: Arc<dyn Verifier<B>>,
 	justification_import: Option<SharedJustificationImport<B>>,
 	finality_proof_import: Option<SharedFinalityProofImport<B>>,
 	finality_proof_request_builder: Option<SharedFinalityProofRequestBuilder<B>>,
@@ -370,7 +362,7 @@ impl<B: BlockT> BlockImporter<B> {
 	fn new(
 		result_port: Receiver<BlockImportWorkerMsg<B>>,
 		worker_sender: Sender<BlockImportWorkerMsg<B>>,
-		verifier: Arc<Verifier<B>>,
+		verifier: Arc<dyn Verifier<B>>,
 		justification_import: Option<SharedJustificationImport<B>>,
 		finality_proof_import: Option<SharedFinalityProofImport<B>>,
 		finality_proof_request_builder: Option<SharedFinalityProofRequestBuilder<B>>,
@@ -667,7 +659,7 @@ pub enum BlockImportError {
 
 /// Imports single notification and send notification to the link (if provided).
 fn import_single_justification<B: BlockT>(
-	link: &Option<Box<Link<B>>>,
+	link: &Option<Box<dyn Link<B>>>,
 	justification_import: &Option<SharedJustificationImport<B>>,
 	who: Origin,
 	hash: B::Hash,
@@ -723,7 +715,7 @@ fn import_single_finality_proof<B: BlockT, V: Verifier<B>>(
 
 /// Process result of block(s) import.
 fn process_import_results<B: BlockT>(
-	link: &Link<B>,
+	link: &dyn Link<B>,
 	results: Vec<(
 		Result<BlockImportResult<NumberFor<B>>, BlockImportError>,
 		B::Hash,
@@ -801,7 +793,7 @@ fn process_import_results<B: BlockT>(
 
 /// Import several blocks at once, returning import result for each block.
 fn import_many_blocks<B: BlockT, V: Verifier<B>>(
-	import_handle: &BlockImport<B, Error = ConsensusError>,
+	import_handle: &dyn BlockImport<B, Error = ConsensusError>,
 	blocks_origin: BlockOrigin,
 	blocks: Vec<IncomingBlock<B>>,
 	verifier: Arc<V>,
@@ -854,7 +846,7 @@ fn import_many_blocks<B: BlockT, V: Verifier<B>>(
 
 /// Single block import function.
 pub fn import_single_block<B: BlockT, V: Verifier<B>>(
-	import_handle: &BlockImport<B, Error = ConsensusError>,
+	import_handle: &dyn BlockImport<B, Error = ConsensusError>,
 	block_origin: BlockOrigin,
 	block: IncomingBlock<B>,
 	verifier: Arc<V>,
@@ -906,7 +898,7 @@ pub fn import_single_block<B: BlockT, V: Verifier<B>>(
 		r => return Ok(r), // Any other successful result means that the block is already imported.
 	}
 
-	let (import_block, new_authorities) = verifier.verify(block_origin, header, justification, block.body)
+	let (import_block, maybe_keys) = verifier.verify(block_origin, header, justification, block.body)
 		.map_err(|msg| {
 			if let Some(ref peer) = peer {
 				trace!(target: "sync", "Verifying {}({}) from {} failed: {}", number, hash, peer, msg);
@@ -917,8 +909,8 @@ pub fn import_single_block<B: BlockT, V: Verifier<B>>(
 		})?;
 
 	let mut cache = HashMap::new();
-	if let Some(authorities) = new_authorities {
-		cache.insert(crate::well_known_cache_keys::AUTHORITIES, authorities.encode());
+	if let Some(keys) = maybe_keys {
+		cache.extend(keys.into_iter());
 	}
 
 	import_error(import_handle.import_block(import_block, cache))
@@ -979,7 +971,7 @@ mod tests {
 			header: B::Header,
 			justification: Option<Justification>,
 			body: Option<Vec<B::Extrinsic>>,
-		) -> Result<(ImportBlock<B>, Option<Vec<AuthorityIdFor<B>>>), String> {
+		) -> Result<(ImportBlock<B>, Option<Vec<(CacheKeyId, Vec<u8>)>>), String> {
 			Ok((ImportBlock {
 				origin,
 				header,

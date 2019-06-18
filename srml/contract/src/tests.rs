@@ -40,7 +40,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use substrate_primitives::storage::well_known_keys;
 use substrate_primitives::Blake2Hasher;
 use system::{self, EventRecord, Phase};
-use {balances, consensus, wabt};
+use {balances, wabt};
 
 mod contract {
 	// Re-export contents of the root. This basically
@@ -72,12 +72,10 @@ impl system::Trait for Test {
 	type BlockNumber = u64;
 	type Hash = H256;
 	type Hashing = BlakeTwo256;
-	type Digest = Digest;
 	type AccountId = u64;
 	type Lookup = IdentityLookup<Self::AccountId>;
 	type Header = Header;
 	type Event = MetaEvent;
-	type Log = DigestItem;
 }
 impl balances::Trait for Test {
 	type Balance = u64;
@@ -91,11 +89,6 @@ impl balances::Trait for Test {
 impl timestamp::Trait for Test {
 	type Moment = u64;
 	type OnTimestampSet = ();
-}
-impl consensus::Trait for Test {
-	type Log = DigestItem;
-	type SessionKey = UintAuthorityId;
-	type InherentOfflineReport = ();
 }
 impl Trait for Test {
 	type Currency = Balances;
@@ -300,15 +293,15 @@ fn account_removal_removes_storage() {
 			// Verify that all entries from account 1 is removed, while
 			// entries from account 2 is in place.
 			{
-				assert!(<AccountDb<Test>>::get_storage(&DirectAccountDb, &1, Some(&trie_id1), key1).is_none());
-				assert!(<AccountDb<Test>>::get_storage(&DirectAccountDb, &1, Some(&trie_id1), key2).is_none());
+				assert!(<dyn AccountDb<Test>>::get_storage(&DirectAccountDb, &1, Some(&trie_id1), key1).is_none());
+				assert!(<dyn AccountDb<Test>>::get_storage(&DirectAccountDb, &1, Some(&trie_id1), key2).is_none());
 
 				assert_eq!(
-					<AccountDb<Test>>::get_storage(&DirectAccountDb, &2, Some(&trie_id2), key1),
+					<dyn AccountDb<Test>>::get_storage(&DirectAccountDb, &2, Some(&trie_id2), key1),
 					Some(b"3".to_vec())
 				);
 				assert_eq!(
-					<AccountDb<Test>>::get_storage(&DirectAccountDb, &2, Some(&trie_id2), key2),
+					<dyn AccountDb<Test>>::get_storage(&DirectAccountDb, &2, Some(&trie_id2), key2),
 					Some(b"4".to_vec())
 				);
 			}
@@ -1002,7 +995,8 @@ const CODE_CHECK_DEFAULT_RENT_ALLOWANCE: &str = r#"
 	)
 )
 "#;
-const HASH_CHECK_DEFAULT_RENT_ALLOWANCE: [u8; 32] = hex!("4f9ec2b94eea522cfff10b77ef4056c631045c00978a457d283950521ecf07b6");
+const HASH_CHECK_DEFAULT_RENT_ALLOWANCE: [u8; 32] =
+	hex!("4f9ec2b94eea522cfff10b77ef4056c631045c00978a457d283950521ecf07b6");
 
 #[test]
 fn default_rent_allowance_on_create() {
