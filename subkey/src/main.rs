@@ -163,6 +163,24 @@ fn execute<C: Crypto<Seed=[u8; 32]>>(matches: clap::ArgMatches) where
 				.expect("URI parameter is required; thus it can't be None; qed");
 			C::print_from_uri(uri, password);
 		},
+		("sign-blob", Some(matches)) => {
+			let suri = matches.value_of("suri")
+				.expect("secret URI parameter is required; thus it can't be None; qed");
+			let pair = C::pair_from_suri(suri, password);
+			let mut message = vec![];
+			let blob = matches.value_of("blob")
+				.expect("blob is required; thus it can't be None; qed");
+			message = hex::decode(&blob).expect("Invalid hex in message");
+			let mut sig;
+			if message.len() > 256 {
+				sig = pair.sign(&blake2_256(&message)[..])
+			} else {
+				sig = pair.sign(&message)
+			}
+			//let sig = pair.sign(&message);
+			println!("{}", hex::encode(&sig));
+			//println!("{}", hex::encode(&message));
+		}
 		("sign", Some(matches)) => {
 			let suri = matches.value_of("suri")
 				.expect("secret URI parameter is required; thus it can't be None; qed");

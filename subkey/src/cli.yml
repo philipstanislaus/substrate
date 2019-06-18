@@ -28,6 +28,17 @@ subcommands:
             index: 1
             required: true
             help: A Key URI to be inspected. May be a secret seed, secret URI (with derivation paths and password), SS58 or public URI.
+  - sign-blob:
+      about: Sign a message
+      args:
+        - blob:
+            index: 1
+            required: true
+            help: The message to sign.
+        - suri:
+            index: 2
+            required: true
+            help: The secret key URI.
   - sign:
       about: Sign a message, provided on STDIN, with a given (secret) key
       args:
