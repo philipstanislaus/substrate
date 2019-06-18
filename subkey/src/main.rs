@@ -109,7 +109,6 @@ fn execute<C: Crypto>(matches: clap::ArgMatches) where
 			let result = vanity::generate_key::<C>(&desired).expect("Key generation failed");
 			C::print_from_uri(&format!("0x{}", HexDisplay::from(&result.seed.as_ref())), None);
 		}
-		},
 		("sign-blob", Some(matches)) => {
 			let suri = matches.value_of("suri")
 				.expect("secret URI parameter is required; thus it can't be None; qed");
@@ -124,9 +123,7 @@ fn execute<C: Crypto>(matches: clap::ArgMatches) where
 			} else {
 				sig = pair.sign(&message)
 			}
-			//let sig = pair.sign(&message);
 			println!("{}", hex::encode(&sig));
-			//println!("{}", hex::encode(&message));
 		}
 		("sign", Some(matches)) => {
 			let suri = matches.value_of("suri")
