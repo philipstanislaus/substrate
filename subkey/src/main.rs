@@ -125,6 +125,7 @@ fn execute<C: Crypto>(matches: clap::ArgMatches) where
 			C::print_from_uri(mnemonic.phrase(), password, maybe_network);
 		}
 		("inspect", Some(matches)) => {
+			// TODO: Accept public key with derivation path.
 			let uri = matches.value_of("uri")
 				.expect("URI parameter is required; thus it can't be None; qed");
 			C::print_from_uri(uri, password, maybe_network);
@@ -137,6 +138,22 @@ fn execute<C: Crypto>(matches: clap::ArgMatches) where
 				None,
 				maybe_network
 			);
+		}
+		("sign-blob", Some(matches)) => {
+			let suri = matches.value_of("suri")
+				.expect("secret URI parameter is required; thus it can't be None; qed");
+			let pair = C::pair_from_suri(suri, password);
+			let mut message = vec![];
+			let blob = matches.value_of("blob")
+				.expect("blob is required; thus it can't be None; qed");
+			message = hex::decode(&blob).expect("Invalid hex in message");
+			let mut sig;
+			if message.len() > 256 {
+				sig = pair.sign(&blake2_256(&message)[..])
+			} else {
+				sig = pair.sign(&message)
+			}
+			println!("{}", hex::encode(&sig));
 		}
 		("sign", Some(matches)) => {
 			let suri = matches.value_of("suri")
