@@ -19,7 +19,7 @@ macro_rules! reserved {
 
 				srml_support::decl_module! {
 					pub struct Module<T: Trait> for enum Call where origin: T::Origin {
-						fn $reserved() -> Result { unreachable!() }
+						fn $reserved(_origin) -> Result { unreachable!() }
 					}
 				}
 			}
@@ -29,5 +29,4 @@ macro_rules! reserved {
 
 reserved!(on_finalize on_initialize on_finalise on_initialise offchain_worker deposit_event);
 
-fn main() {
-}
+fn main() {}

@@ -17,44 +17,16 @@
 //! Stuff to do with the runtime's storage.
 
 use crate::rstd::prelude::*;
-use crate::rstd::borrow::Borrow;
-use codec::{Codec, Encode, Decode, KeyedVec, Input, EncodeAppend};
+use crate::rstd::{borrow::Borrow, iter::FromIterator};
+use codec::{Codec, Encode, Decode, KeyedVec, EncodeAppend};
 use hashed::generator::{HashedStorage, StorageHasher};
 use unhashed::generator::UnhashedStorage;
+use crate::traits::{StorageDefault, Len};
 
 #[macro_use]
 pub mod storage_items;
 pub mod unhashed;
 pub mod hashed;
-
-struct IncrementalInput<'a> {
-	key: &'a [u8],
-	pos: usize,
-}
-
-impl<'a> Input for IncrementalInput<'a> {
-	fn read(&mut self, into: &mut [u8]) -> usize {
-		let len = runtime_io::read_storage(self.key, into, self.pos).unwrap_or(0);
-		let read = crate::rstd::cmp::min(len, into.len());
-		self.pos += read;
-		read
-	}
-}
-
-struct IncrementalChildInput<'a> {
-	storage_key: &'a [u8],
-	key: &'a [u8],
-	pos: usize,
-}
-
-impl<'a> Input for IncrementalChildInput<'a> {
-	fn read(&mut self, into: &mut [u8]) -> usize {
-		let len = runtime_io::read_child_storage(self.storage_key, self.key, into, self.pos).unwrap_or(0);
-		let read = crate::rstd::cmp::min(len, into.len());
-		self.pos += read;
-		read
-	}
-}
 
 /// The underlying runtime storage.
 pub struct RuntimeStorage;
@@ -104,7 +76,7 @@ impl UnhashedStorage for RuntimeStorage {
 	}
 
 	/// Put a value in under a key.
-	fn put<T: Encode>(&mut self, key: &[u8], val: &T) {
+	fn put<T: Encode + ?Sized>(&mut self, key: &[u8], val: &T) {
 		unhashed::put(key, val)
 	}
 
@@ -136,6 +108,8 @@ impl UnhashedStorage for RuntimeStorage {
 pub trait StorageValue<T: Codec> {
 	/// The type that get/take return.
 	type Query;
+	/// Something that can provide the default value of this storage type.
+	type Default: StorageDefault<T>;
 
 	/// Get the storage key.
 	fn key() -> &'static [u8];
@@ -149,6 +123,10 @@ pub trait StorageValue<T: Codec> {
 	/// Store a value under this key into the provided storage instance.
 	fn put<Arg: Borrow<T>>(val: Arg);
 
+	/// Store a value under this key into the provided storage instance; this can take any reference
+	/// type that derefs to `T` (and has `Encode` implemented).
+	fn put_ref<Arg: ?Sized + Encode>(val: &Arg) where T: AsRef<Arg>;
+
 	/// Mutate the value
 	fn mutate<R, F: FnOnce(&mut Self::Query) -> R>(f: F) -> R;
 
@@ -161,12 +139,39 @@ pub trait StorageValue<T: Codec> {
 	/// Append the given item to the value in the storage.
 	///
 	/// `T` is required to implement `codec::EncodeAppend`.
-	fn append<I: Encode>(items: &[I]) -> Result<(), &'static str>
-		where T: EncodeAppend<Item=I>;
+	fn append<'a, I, R>(items: R) -> Result<(), &'static str> where
+		I: 'a + Encode,
+		T: EncodeAppend<Item=I>,
+		R: IntoIterator<Item=&'a I>,
+		R::IntoIter: ExactSizeIterator;
+
+	/// Append the given items to the value in the storage.
+	///
+	/// `T` is required to implement `Codec::EncodeAppend`.
+	///
+	/// Upon any failure, it replaces `items` as the new value (assuming that the previous stored
+	/// data is simply corrupt and no longer usable).
+	///
+	/// ### WARNING
+	///
+	/// use with care; if your use-case is not _exactly_ as what this function is doing,
+	/// you should use append and sensibly handle failure within the runtime code if it happens.
+	fn append_or_put<'a, I, R>(items: R) where
+		I: 'a + Encode + Clone,
+		T: EncodeAppend<Item=I> + FromIterator<I>,
+		R: IntoIterator<Item=&'a I> + Clone,
+		R::IntoIter: ExactSizeIterator;
+
+	/// Read the length of the value in a fast way, without decoding the entire value.
+	///
+	/// `T` is required to implement `Codec::DecodeLength`.
+	fn decode_len() -> Result<usize, &'static str>
+		where T: codec::DecodeLength, T: Len;
 }
 
 impl<T: Codec, U> StorageValue<T> for U where U: hashed::generator::StorageValue<T> {
 	type Query = U::Query;
+	type Default = U::Default;
 
 	fn key() -> &'static [u8] {
 		<U as hashed::generator::StorageValue<T>>::key()
@@ -180,6 +185,9 @@ impl<T: Codec, U> StorageValue<T> for U where U: hashed::generator::StorageValue
 	fn put<Arg: Borrow<T>>(val: Arg) {
 		U::put(val.borrow(), &mut RuntimeStorage)
 	}
+	fn put_ref<Arg: ?Sized + Encode>(val: &Arg) where T: AsRef<Arg> {
+		U::put_ref(val, &mut RuntimeStorage)
+	}
 	fn mutate<R, F: FnOnce(&mut Self::Query) -> R>(f: F) -> R {
 		U::mutate(f, &mut RuntimeStorage)
 	}
@@ -189,10 +197,26 @@ impl<T: Codec, U> StorageValue<T> for U where U: hashed::generator::StorageValue
 	fn take() -> Self::Query {
 		U::take(&mut RuntimeStorage)
 	}
-	fn append<I: Encode>(items: &[I]) -> Result<(), &'static str>
-		where T: EncodeAppend<Item=I>
+	fn append<'a, I, R>(items: R) -> Result<(), &'static str> where
+		I: 'a + Encode,
+		T: EncodeAppend<Item=I>,
+		R: IntoIterator<Item=&'a I>,
+		R::IntoIter: ExactSizeIterator,
 	{
 		U::append(items, &mut RuntimeStorage)
+	}
+	fn append_or_put<'a, I, R>(items: R) where
+		I: 'a + Encode + Clone,
+		T: EncodeAppend<Item=I> + FromIterator<I>,
+		R: IntoIterator<Item=&'a I> + Clone,
+		R::IntoIter: ExactSizeIterator,
+	{
+		U::append_or_put(items, &mut RuntimeStorage)
+	}
+	fn decode_len() -> Result<usize, &'static str>
+		where T: codec::DecodeLength, T: Len
+	{
+		U::decode_len(&mut RuntimeStorage)
 	}
 }
 
@@ -200,6 +224,8 @@ impl<T: Codec, U> StorageValue<T> for U where U: hashed::generator::StorageValue
 pub trait StorageMap<K: Codec, V: Codec> {
 	/// The type that get/take return.
 	type Query;
+	/// Something that can provide the default value of this storage type.
+	type Default: StorageDefault<V>;
 
 	/// Get the prefix key in storage.
 	fn prefix() -> &'static [u8];
@@ -213,8 +239,15 @@ pub trait StorageMap<K: Codec, V: Codec> {
 	/// Load the value associated with the given key from the map.
 	fn get<KeyArg: Borrow<K>>(key: KeyArg) -> Self::Query;
 
+	/// Swap the values of two keys.
+	fn swap<KeyArg1: Borrow<K>, KeyArg2: Borrow<K>>(key1: KeyArg1, key2: KeyArg2);
+
 	/// Store a value to be associated with the given key from the map.
 	fn insert<KeyArg: Borrow<K>, ValArg: Borrow<V>>(key: KeyArg, val: ValArg);
+
+	/// Store a value under this key into the provided storage instance; this can take any reference
+	/// type that derefs to `T` (and has `Encode` implemented).
+	fn insert_ref<KeyArg: Borrow<K>, ValArg: ?Sized + Encode>(key: KeyArg, val: &ValArg) where V: AsRef<ValArg>;
 
 	/// Remove the value under a key.
 	fn remove<KeyArg: Borrow<K>>(key: KeyArg);
@@ -228,6 +261,7 @@ pub trait StorageMap<K: Codec, V: Codec> {
 
 impl<K: Codec, V: Codec, U> StorageMap<K, V> for U where U: hashed::generator::StorageMap<K, V> {
 	type Query = U::Query;
+	type Default = U::Default;
 
 	fn prefix() -> &'static [u8] {
 		<U as hashed::generator::StorageMap<K, V>>::prefix()
@@ -245,8 +279,16 @@ impl<K: Codec, V: Codec, U> StorageMap<K, V> for U where U: hashed::generator::S
 		U::get(key.borrow(), &RuntimeStorage)
 	}
 
+	fn swap<KeyArg1: Borrow<K>, KeyArg2: Borrow<K>>(key1: KeyArg1, key2: KeyArg2) {
+		U::swap(key1.borrow(), key2.borrow(), &mut RuntimeStorage)
+	}
+
 	fn insert<KeyArg: Borrow<K>, ValArg: Borrow<V>>(key: KeyArg, val: ValArg) {
 		U::insert(key.borrow(), val.borrow(), &mut RuntimeStorage)
+	}
+
+	fn insert_ref<KeyArg: Borrow<K>, ValArg: ?Sized + Encode>(key: KeyArg, val: &ValArg) where V: AsRef<ValArg> {
+		U::insert_ref(key.borrow(), val, &mut RuntimeStorage)
 	}
 
 	fn remove<KeyArg: Borrow<K>>(key: KeyArg) {
@@ -267,17 +309,84 @@ pub trait AppendableStorageMap<K: Codec, V: Codec>: StorageMap<K, V> {
 	/// Append the given item to the value in the storage.
 	///
 	/// `T` is required to implement `codec::EncodeAppend`.
-	fn append<KeyArg: Borrow<K>, I: Encode>(key: KeyArg, items: &[I]) -> Result<(), &'static str>
-		where V: EncodeAppend<Item=I>;
+	fn append<'a, KeyArg, I, R>(
+		key: KeyArg,
+		items: R,
+	) -> Result<(), &'static str> where
+		KeyArg: Borrow<K>,
+		I: 'a + codec::Encode,
+		V: EncodeAppend<Item=I>,
+		R: IntoIterator<Item=&'a I> + Clone,
+		R::IntoIter: ExactSizeIterator;
+
+	/// Append the given items to the value in the storage.
+	///
+	/// `T` is required to implement `codec::EncodeAppend`.
+	///
+	/// Upon any failure, it replaces `items` as the new value (assuming that the previous stored
+	/// data is simply corrupt and no longer usable).
+	///
+	/// WARNING: use with care; if your use-case is not _exactly_ as what this function is doing,
+	/// you should use append and sensibly handle failure within the runtime code if it happens.
+	fn append_or_insert<'a, KeyArg, I, R>(
+		key: KeyArg,
+		items: R,
+	) where
+		KeyArg: Borrow<K>,
+		I: 'a + codec::Encode + Clone,
+		V: codec::EncodeAppend<Item=I> + FromIterator<I>,
+		R: IntoIterator<Item=&'a I> + Clone,
+		R::IntoIter: ExactSizeIterator;
 }
 
 impl<K: Codec, V: Codec, U> AppendableStorageMap<K, V> for U
 	where U: hashed::generator::AppendableStorageMap<K, V>
 {
-	fn append<KeyArg: Borrow<K>, I: Encode>(key: KeyArg, items: &[I]) -> Result<(), &'static str>
-		where V: EncodeAppend<Item=I>
+	fn append<'a, KeyArg, I, R>(
+		key: KeyArg,
+		items: R,
+	) -> Result<(), &'static str> where
+		KeyArg: Borrow<K>,
+		I: 'a + codec::Encode,
+		V: EncodeAppend<Item=I>,
+		R: IntoIterator<Item=&'a I> + Clone,
+		R::IntoIter: ExactSizeIterator,
 	{
 		U::append(key.borrow(), items, &mut RuntimeStorage)
+	}
+
+	fn append_or_insert<'a, KeyArg, I, R>(
+		key: KeyArg,
+		items: R,
+	) where
+		KeyArg: Borrow<K>,
+		I: 'a + codec::Encode + Clone,
+		V: codec::EncodeAppend<Item=I> + FromIterator<I>,
+		R: IntoIterator<Item=&'a I> + Clone,
+		R::IntoIter: ExactSizeIterator,
+	{
+		U::append_or_insert(key.borrow(), items, &mut RuntimeStorage)
+	}
+}
+
+/// A storage map with a decodable length.
+pub trait DecodeLengthStorageMap<K: Codec, V: Codec>: StorageMap<K, V> {
+	/// Read the length of the value in a fast way, without decoding the entire value.
+	///
+	/// `T` is required to implement `Codec::DecodeLength`.
+	///
+	/// Has the same logic as [`StorageValue`](trait.StorageValue.html).
+	fn decode_len<KeyArg: Borrow<K>>(key: KeyArg) -> Result<usize, &'static str>
+		where V: codec::DecodeLength, V: Len;
+}
+
+impl <K: Codec, V: Codec, U> DecodeLengthStorageMap<K, V> for U
+	where U: hashed::generator::DecodeLengthStorageMap<K, V>
+{
+	fn decode_len<KeyArg: Borrow<K>>(key: KeyArg) -> Result<usize, &'static str>
+		where V: codec::DecodeLength, V: Len
+	{
+		U::decode_len(key.borrow(), &mut RuntimeStorage)
 	}
 }
 
@@ -317,60 +426,83 @@ impl<K: Codec, V: Codec, U> EnumerableStorageMap<K, V> for U
 /// is a hash of a `Key2`.
 ///
 /// /!\ be careful while choosing the Hash, indeed malicious could craft second keys to lower the trie.
-pub trait StorageDoubleMap<K1: Codec, K2: Codec, V: Codec> {
+pub trait StorageDoubleMap<K1: Encode, K2: Encode, V: Codec> {
 	/// The type that get/take returns.
 	type Query;
 
-	/// Get the prefix key in storage.
 	fn prefix() -> &'static [u8];
 
-	/// Get the storage key used to fetch a value corresponding to a specific key.
-	fn key_for<KArg1: Borrow<K1>, KArg2: Borrow<K2>>(k1: KArg1, k2: KArg2) -> Vec<u8>;
-
-	/// Get the storage prefix used to fetch keys corresponding to a specific key1.
-	fn prefix_for<KArg1: Borrow<K1>>(k1: KArg1) -> Vec<u8>;
-
-	/// true if the value is defined in storage.
-	fn exists<KArg1: Borrow<K1>, KArg2: Borrow<K2>>(k1: KArg1, k2: KArg2) -> bool;
-
-	/// Load the value associated with the given key from the map.
-	fn get<KArg1: Borrow<K1>, KArg2: Borrow<K2>>(k1: KArg1, k2: KArg2) -> Self::Query;
-
-	/// Take the value under a key.
-	fn take<KArg1: Borrow<K1>, KArg2: Borrow<K2>>(k1: KArg1, k2: KArg2) -> Self::Query;
-
-	/// Store a value to be associated with the given key from the map.
-	fn insert<KArg1: Borrow<K1>, KArg2: Borrow<K2>, VArg: Borrow<V>>(k1: KArg1, k2: KArg2, val: VArg);
-
-	/// Remove the value under a key.
-	fn remove<KArg1: Borrow<K1>, KArg2: Borrow<K2>>(k1: KArg1, k2: KArg2);
-
-	/// Removes all entries that shares the `k1` as the first key.
-	fn remove_prefix<KArg1: Borrow<K1>>(k1: KArg1);
-
-	/// Mutate the value under a key.
-	fn mutate<KArg1, KArg2, R, F>(k1: KArg1, k2: KArg2, f: F) -> R
+	fn key_for<KArg1, KArg2>(k1: &KArg1, k2: &KArg2) -> Vec<u8>
 	where
-		KArg1: Borrow<K1>,
-		KArg2: Borrow<K2>,
+		K1: Borrow<KArg1>,
+		K2: Borrow<KArg2>,
+		KArg1: ?Sized + Encode,
+		KArg2: ?Sized + Encode;
+
+	fn prefix_for<KArg1>(k1: &KArg1) -> Vec<u8> where KArg1: ?Sized + Encode, K1: Borrow<KArg1>;
+
+	fn exists<KArg1, KArg2>(k1: &KArg1, k2: &KArg2) -> bool
+	where
+		K1: Borrow<KArg1>,
+		K2: Borrow<KArg2>,
+		KArg1: ?Sized + Encode,
+		KArg2: ?Sized + Encode;
+
+	fn get<KArg1, KArg2>(k1: &KArg1, k2: &KArg2) -> Self::Query
+	where
+		K1: Borrow<KArg1>,
+		K2: Borrow<KArg2>,
+		KArg1: ?Sized + Encode,
+		KArg2: ?Sized + Encode;
+
+	fn take<KArg1, KArg2>(k1: &KArg1, k2: &KArg2) -> Self::Query
+	where
+		K1: Borrow<KArg1>,
+		K2: Borrow<KArg2>,
+		KArg1: ?Sized + Encode,
+		KArg2: ?Sized + Encode;
+
+	fn insert<KArg1, KArg2, VArg>(k1: &KArg1, k2: &KArg2, val: &VArg)
+	where
+		K1: Borrow<KArg1>,
+		K2: Borrow<KArg2>,
+		V: Borrow<VArg>,
+		KArg1: ?Sized + Encode,
+		KArg2: ?Sized + Encode,
+		VArg: ?Sized + Encode;
+
+	fn remove<KArg1, KArg2>(k1: &KArg1, k2: &KArg2)
+	where
+		K1: Borrow<KArg1>,
+		K2: Borrow<KArg2>,
+		KArg1: ?Sized + Encode,
+		KArg2: ?Sized + Encode;
+
+	fn remove_prefix<KArg1>(k1: &KArg1) where KArg1: ?Sized + Encode, K1: Borrow<KArg1>;
+
+	fn mutate<KArg1, KArg2, R, F>(k1: &KArg1, k2: &KArg2, f: F) -> R
+	where
+		K1: Borrow<KArg1>,
+		K2: Borrow<KArg2>,
+		KArg1: ?Sized + Encode,
+		KArg2: ?Sized + Encode,
 		F: FnOnce(&mut Self::Query) -> R;
 
-	/// Append the given items to the value under the key specified.
-	///
-	/// `V` is required to implement `codec::EncodeAppend<Item=I>`.
 	fn append<KArg1, KArg2, I>(
-		k1: KArg1,
-		k2: KArg2,
+		k1: &KArg1,
+		k2: &KArg2,
 		items: &[I],
 	) -> Result<(), &'static str>
 	where
-		KArg1: Borrow<K1>,
-		KArg2: Borrow<K2>,
+		K1: Borrow<KArg1>,
+		K2: Borrow<KArg2>,
+		KArg1: ?Sized + Encode,
+		KArg2: ?Sized + Encode,
 		I: codec::Encode,
 		V: EncodeAppend<Item=I>;
 }
 
-impl<K1: Codec, K2: Codec, V: Codec, U> StorageDoubleMap<K1, K2, V> for U
+impl<K1: Encode, K2: Encode, V: Codec, U> StorageDoubleMap<K1, K2, V> for U
 where
 	U: unhashed::generator::StorageDoubleMap<K1, K2, V>
 {
@@ -380,59 +512,101 @@ where
 		<U as unhashed::generator::StorageDoubleMap<K1, K2, V>>::prefix()
 	}
 
-	fn key_for<KArg1: Borrow<K1>, KArg2: Borrow<K2>>(k1: KArg1, k2: KArg2) -> Vec<u8> {
-		<U as unhashed::generator::StorageDoubleMap<K1, K2, V>>::key_for(k1.borrow(), k2.borrow())
+	fn key_for<KArg1, KArg2>(k1: &KArg1, k2: &KArg2) -> Vec<u8>
+	where
+		K1: Borrow<KArg1>,
+		K2: Borrow<KArg2>,
+		KArg1: ?Sized + Encode,
+		KArg2: ?Sized + Encode,
+	{
+		<U as unhashed::generator::StorageDoubleMap<K1, K2, V>>::key_for(k1, k2)
 	}
 
-	fn prefix_for<KArg1: Borrow<K1>>(k1: KArg1) -> Vec<u8> {
-		<U as unhashed::generator::StorageDoubleMap<K1, K2, V>>::prefix_for(k1.borrow())
+	fn prefix_for<KArg1>(k1: &KArg1) -> Vec<u8> where KArg1: ?Sized + Encode, K1: Borrow<KArg1> {
+		<U as unhashed::generator::StorageDoubleMap<K1, K2, V>>::prefix_for(k1)
 	}
 
-	fn exists<KArg1: Borrow<K1>, KArg2: Borrow<K2>>(k1: KArg1, k2: KArg2) -> bool {
-		U::exists(k1.borrow(), k2.borrow(), &RuntimeStorage)
+	fn exists<KArg1, KArg2>(k1: &KArg1, k2: &KArg2) -> bool
+	where
+		K1: Borrow<KArg1>,
+		K2: Borrow<KArg2>,
+		KArg1: ?Sized + Encode,
+		KArg2: ?Sized + Encode,
+	{
+		U::exists(k1, k2, &RuntimeStorage)
 	}
 
-	fn get<KArg1: Borrow<K1>, KArg2: Borrow<K2>>(k1: KArg1, k2: KArg2) -> Self::Query {
-		U::get(k1.borrow(), k2.borrow(), &RuntimeStorage)
+	fn get<KArg1, KArg2>(k1: &KArg1, k2: &KArg2) -> Self::Query
+	where
+		K1: Borrow<KArg1>,
+		K2: Borrow<KArg2>,
+		KArg1: ?Sized + Encode,
+		KArg2: ?Sized + Encode,
+	{
+		U::get(k1, k2, &RuntimeStorage)
 	}
 
-	fn take<KArg1: Borrow<K1>, KArg2: Borrow<K2>>(k1: KArg1, k2: KArg2) -> Self::Query {
+	fn take<KArg1, KArg2>(k1: &KArg1, k2: &KArg2) -> Self::Query
+	where
+		K1: Borrow<KArg1>,
+		K2: Borrow<KArg2>,
+		KArg1: ?Sized + Encode,
+		KArg2: ?Sized + Encode,
+	{
 		U::take(k1.borrow(), k2.borrow(), &mut RuntimeStorage)
 	}
 
-	fn insert<KArg1: Borrow<K1>, KArg2: Borrow<K2>, VArg: Borrow<V>>(k1: KArg1, k2: KArg2, val: VArg) {
-		U::insert(k1.borrow(), k2.borrow(), val.borrow(), &mut RuntimeStorage)
-	}
-
-	fn remove<KArg1: Borrow<K1>, KArg2: Borrow<K2>>(k1: KArg1, k2: KArg2) {
-		U::remove(k1.borrow(), k2.borrow(), &mut RuntimeStorage)
-	}
-
-	fn remove_prefix<KArg1: Borrow<K1>>(k1: KArg1) {
-		U::remove_prefix(k1.borrow(), &mut RuntimeStorage)
-	}
-
-	fn mutate<KArg1, KArg2, R, F>(k1: KArg1, k2: KArg2, f: F) -> R
+	fn insert<KArg1, KArg2, VArg>(k1: &KArg1, k2: &KArg2, val: &VArg)
 	where
-		KArg1: Borrow<K1>,
-		KArg2: Borrow<K2>,
+		K1: Borrow<KArg1>,
+		K2: Borrow<KArg2>,
+		V: Borrow<VArg>,
+		KArg1: ?Sized + Encode,
+		KArg2: ?Sized + Encode,
+		VArg: ?Sized + Encode,
+	{
+		U::insert(k1, k2, val, &mut RuntimeStorage)
+	}
+
+	fn remove<KArg1, KArg2>(k1: &KArg1, k2: &KArg2)
+	where
+		K1: Borrow<KArg1>,
+		K2: Borrow<KArg2>,
+		KArg1: ?Sized + Encode,
+		KArg2: ?Sized + Encode,
+	{
+		U::remove(k1, k2, &mut RuntimeStorage)
+	}
+
+	fn remove_prefix<KArg1>(k1: &KArg1) where KArg1: ?Sized + Encode, K1: Borrow<KArg1> {
+		U::remove_prefix(k1, &mut RuntimeStorage)
+	}
+
+	fn mutate<KArg1, KArg2, R, F>(k1: &KArg1, k2: &KArg2, f: F) -> R
+	where
+		K1: Borrow<KArg1>,
+		K2: Borrow<KArg2>,
+		KArg1: ?Sized + Encode,
+		KArg2: ?Sized + Encode,
 		F: FnOnce(&mut Self::Query) -> R
 	{
-		U::mutate(k1.borrow(), k2.borrow(), f, &mut RuntimeStorage)
+		U::mutate(k1, k2, f, &mut RuntimeStorage)
 	}
 
 	fn append<KArg1, KArg2, I>(
-		k1: KArg1,
-		k2: KArg2,
+		k1: &KArg1,
+		k2: &KArg2,
 		items: &[I],
 	) -> Result<(), &'static str>
 	where
-		KArg1: Borrow<K1>,
-		KArg2: Borrow<K2>,
+		K1: Borrow<KArg1>,
+		K2: Borrow<KArg2>,
+		KArg1: ?Sized + Encode,
+		KArg2: ?Sized + Encode,
 		I: codec::Encode,
 		V: EncodeAppend<Item=I>,
 	{
-		U::append(k1.borrow(), k2.borrow(), items, &mut RuntimeStorage)
+		U::append(k1, k2, items, &mut RuntimeStorage)
 	}
 }
 
@@ -442,17 +616,12 @@ where
 /// Note that `storage_key` must be unique and strong (strong in the sense of being long enough to
 /// avoid collision from a resistant hash function (which unique implies)).
 pub mod child {
-	use super::{Codec, Decode, Vec, IncrementalChildInput};
+	use super::{Codec, Decode, Vec};
 
 	/// Return the value of the item in storage under `key`, or `None` if there is no explicit entry.
 	pub fn get<T: Codec + Sized>(storage_key: &[u8], key: &[u8]) -> Option<T> {
-		runtime_io::read_child_storage(storage_key, key, &mut [0; 0][..], 0).map(|_| {
-			let mut input = IncrementalChildInput {
-				storage_key,
-				key,
-				pos: 0,
-			};
-			Decode::decode(&mut input).expect("storage is not null, therefore must be a valid type")
+		runtime_io::child_storage(storage_key, key).map(|v| {
+			Decode::decode(&mut &v[..]).expect("storage is not null, therefore must be a valid type")
 		})
 	}
 

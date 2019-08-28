@@ -19,12 +19,11 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
-use futures::{Future, IntoFuture};
 use parking_lot::{RwLock, Mutex};
 
-use runtime_primitives::{generic::BlockId, Justification, StorageOverlay, ChildrenStorageOverlay};
+use sr_primitives::{generic::BlockId, Justification, StorageOverlay, ChildrenStorageOverlay};
 use state_machine::{Backend as StateBackend, TrieBackend, backend::InMemory as InMemoryState};
-use runtime_primitives::traits::{Block as BlockT, NumberFor, Zero, Header};
+use sr_primitives::traits::{Block as BlockT, NumberFor, Zero, Header};
 use crate::in_mem::{self, check_genesis_storage};
 use crate::backend::{
 	AuxStore, Backend as ClientBackend, BlockImportOperation, RemoteBackend, NewBlockState,
@@ -38,7 +37,7 @@ use hash_db::Hasher;
 use trie::MemoryDB;
 use consensus::well_known_cache_keys;
 
-const IN_MEMORY_EXPECT_PROOF: &str = "InMemory state backend has Void error type and always suceeds; qed";
+const IN_MEMORY_EXPECT_PROOF: &str = "InMemory state backend has Void error type and always succeeds; qed";
 
 /// Light client backend.
 pub struct Backend<S, F, H: Hasher> {
@@ -118,6 +117,7 @@ impl<S, F, Block, H> ClientBackend<Block, H> for Backend<S, F, H> where
 	type Blockchain = Blockchain<S, F>;
 	type State = OnDemandOrGenesisState<Block, S, F, H>;
 	type ChangesTrieStorage = in_mem::ChangesTrieStorage<Block, H>;
+	type OffchainStorage = in_mem::OffchainStorage;
 
 	fn begin_operation(&self) -> ClientResult<Self::BlockImportOperation> {
 		Ok(ImportOperation {
@@ -192,6 +192,10 @@ impl<S, F, Block, H> ClientBackend<Block, H> for Backend<S, F, H> where
 	}
 
 	fn changes_trie_storage(&self) -> Option<&Self::ChangesTrieStorage> {
+		None
+	}
+
+	fn offchain_storage(&self) -> Option<Self::OffchainStorage> {
 		None
 	}
 
@@ -354,14 +358,15 @@ where
 			*self.cached_header.write() = Some(cached_header);
 		}
 
-		self.fetcher.upgrade().ok_or(ClientError::NotAvailableOnLightClient)?
-			.remote_read(RemoteReadRequest {
-				block: self.block,
-				header: header.expect("if block above guarantees that header is_some(); qed"),
-				key: key.to_vec(),
-				retry_count: None,
-			})
-			.into_future().wait()
+		futures::executor::block_on(
+			self.fetcher.upgrade().ok_or(ClientError::NotAvailableOnLightClient)?
+				.remote_read(RemoteReadRequest {
+					block: self.block,
+					header: header.expect("if block above guarantees that header is_some(); qed"),
+					key: key.to_vec(),
+					retry_count: None,
+				})
+		)
 	}
 
 	fn child_storage(&self, _storage_key: &[u8], _key: &[u8]) -> ClientResult<Option<Vec<u8>>> {
@@ -373,6 +378,15 @@ where
 	}
 
 	fn for_keys_in_child_storage<A: FnMut(&[u8])>(&self, _storage_key: &[u8], _action: A) {
+		// whole state is not available on light node
+	}
+
+	fn for_child_keys_with_prefix<A: FnMut(&[u8])>(
+		&self,
+		_storage_key: &[u8],
+		_prefix: &[u8],
+		_action: A,
+	) {
 		// whole state is not available on light node
 	}
 
@@ -448,6 +462,20 @@ where
 			OnDemandOrGenesisState::OnDemand(ref state) =>
 				StateBackend::<H>::for_keys_in_child_storage(state, storage_key, action),
 			OnDemandOrGenesisState::Genesis(ref state) => state.for_keys_in_child_storage(storage_key, action),
+		}
+	}
+
+	fn for_child_keys_with_prefix<A: FnMut(&[u8])>(
+		&self,
+		storage_key: &[u8],
+		prefix: &[u8],
+		action: A,
+	) {
+		match *self {
+			OnDemandOrGenesisState::OnDemand(ref state) =>
+				StateBackend::<H>::for_child_keys_with_prefix(state, storage_key, prefix, action),
+			OnDemandOrGenesisState::Genesis(ref state) =>
+				state.for_child_keys_with_prefix(storage_key, prefix, action),
 		}
 	}
 

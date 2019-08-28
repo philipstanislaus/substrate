@@ -20,6 +20,8 @@ use std::path::PathBuf;
 use structopt::{StructOpt, clap::{arg_enum, _clap_count_exprs, App, AppSettings, SubCommand, Arg}};
 use client;
 
+pub use crate::execution_strategy::ExecutionStrategy;
+
 /// Auxiliary macro to implement `GetLogFilter` for all types that have the `shared_params` field.
 macro_rules! impl_get_log_filter {
 	( $type:ident ) => {
@@ -31,18 +33,6 @@ macro_rules! impl_get_log_filter {
 	}
 }
 
-arg_enum! {
-	/// How to execute blocks
-	#[derive(Debug, Clone)]
-	pub enum ExecutionStrategy {
-		Native,
-		Wasm,
-		Both,
-		NativeElseWasm,
-		NativeWhenPossible,
-	}
-}
-
 impl Into<client::ExecutionStrategy> for ExecutionStrategy {
 	fn into(self) -> client::ExecutionStrategy {
 		match self {
@@ -50,13 +40,13 @@ impl Into<client::ExecutionStrategy> for ExecutionStrategy {
 			ExecutionStrategy::Wasm => client::ExecutionStrategy::AlwaysWasm,
 			ExecutionStrategy::Both => client::ExecutionStrategy::Both,
 			ExecutionStrategy::NativeElseWasm => client::ExecutionStrategy::NativeElseWasm,
-			ExecutionStrategy::NativeWhenPossible => client::ExecutionStrategy::NativeWhenPossible,
 		}
 	}
 }
 
 arg_enum! {
-	/// How to execute blocks
+	/// Whether off-chain workers are enabled.
+	#[allow(missing_docs)]
 	#[derive(Debug, Clone)]
 	pub enum OffchainWorkerEnabled {
 		Always,
@@ -129,6 +119,7 @@ pub struct NetworkConfigurationParams {
 }
 
 arg_enum! {
+	#[allow(missing_docs)]
 	#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 	pub enum NodeKeyType {
 		Secp256k1,
@@ -227,7 +218,7 @@ pub struct TransactionPoolParams {
 pub struct ExecutionStrategies {
 	/// The means of execution used when calling into the runtime while syncing blocks.
 	#[structopt(
-		long = "syncing-execution",
+		long = "execution-syncing",
 		value_name = "STRATEGY",
 		raw(
 			possible_values = "&ExecutionStrategy::variants()",
@@ -235,11 +226,11 @@ pub struct ExecutionStrategies {
 			default_value = r#""NativeElseWasm""#
 		)
 	)]
-	pub syncing_execution: ExecutionStrategy,
+	pub execution_syncing: ExecutionStrategy,
 
 	/// The means of execution used when calling into the runtime while importing blocks.
 	#[structopt(
-		long = "importing-execution",
+		long = "execution-import-block",
 		value_name = "STRATEGY",
 		raw(
 			possible_values = "&ExecutionStrategy::variants()",
@@ -247,11 +238,11 @@ pub struct ExecutionStrategies {
 			default_value = r#""NativeElseWasm""#
 		)
 	)]
-	pub importing_execution: ExecutionStrategy,
+	pub execution_import_block: ExecutionStrategy,
 
 	/// The means of execution used when calling into the runtime while constructing blocks.
 	#[structopt(
-		long = "block-construction-execution",
+		long = "execution-block-construction",
 		value_name = "STRATEGY",
 		raw(
 			possible_values = "&ExecutionStrategy::variants()",
@@ -259,49 +250,59 @@ pub struct ExecutionStrategies {
 			default_value = r#""Wasm""#
 		)
 	)]
-	pub block_construction_execution: ExecutionStrategy,
+	pub execution_block_construction: ExecutionStrategy,
 
 	/// The means of execution used when calling into the runtime while using an off-chain worker.
 	#[structopt(
-		long = "offchain-worker-execution",
+		long = "execution-offchain-worker",
 		value_name = "STRATEGY",
 		raw(
 			possible_values = "&ExecutionStrategy::variants()",
 			case_insensitive = "true",
-			default_value = r#""NativeWhenPossible""#
+			default_value = r#""Native""#
 		)
 	)]
-	pub offchain_worker_execution: ExecutionStrategy,
+	pub execution_offchain_worker: ExecutionStrategy,
 
 	/// The means of execution used when calling into the runtime while not syncing, importing or constructing blocks.
 	#[structopt(
-		long = "other-execution",
+		long = "execution-other",
 		value_name = "STRATEGY",
 		raw(
 			possible_values = "&ExecutionStrategy::variants()",
 			case_insensitive = "true",
-			default_value = r#""Wasm""#
+			default_value = r#""Native""#
 		)
 	)]
-	pub other_execution: ExecutionStrategy,
+	pub execution_other: ExecutionStrategy,
+
+	/// The execution strategy that should be used by all execution contexts.
+	#[structopt(
+		long = "execution",
+		value_name = "STRATEGY",
+		raw(
+			possible_values = "&ExecutionStrategy::variants()",
+			case_insensitive = "true",
+			conflicts_with_all = "&[
+				\"execution_other\",
+				\"execution_offchain_worker\",
+				\"execution_block_construction\",
+				\"execution_import_block\",
+				\"execution_syncing\",
+			]"
+		)
+	)]
+	pub execution: Option<ExecutionStrategy>,
 }
 
 /// The `run` command used to run a node.
 #[derive(Debug, StructOpt, Clone)]
 pub struct RunCmd {
-	/// Specify custom keystore path
-	#[structopt(long = "keystore-path", value_name = "PATH", parse(from_os_str))]
-	pub keystore_path: Option<PathBuf>,
-
-	/// Specify additional key seed
-	#[structopt(long = "key", value_name = "STRING")]
-	pub key: Option<String>,
-
 	/// Enable validator mode
 	#[structopt(long = "validator")]
 	pub validator: bool,
 
-	/// Disable GRANDPA when running in validator mode
+	/// Disable GRANDPA voter when running in validator mode, otherwise disables the GRANDPA observer
 	#[structopt(long = "no-grandpa")]
 	pub no_grandpa: bool,
 
@@ -400,9 +401,32 @@ pub struct RunCmd {
 	#[structopt(long = "force-authoring")]
 	pub force_authoring: bool,
 
-	/// Interactive password for validator key.
-	#[structopt(short = "i")]
-	pub interactive_password: bool,
+	/// Specify custom keystore path.
+	#[structopt(long = "keystore-path", value_name = "PATH", parse(from_os_str))]
+	pub keystore_path: Option<PathBuf>,
+
+	/// Use interactive shell for entering the password used by the keystore.
+	#[structopt(
+		long = "password-interactive",
+		raw(conflicts_with_all = "&[ \"password\", \"password_filename\" ]")
+	)]
+	pub password_interactive: bool,
+
+	/// Password used by the keystore.
+	#[structopt(
+		long = "password",
+		raw(conflicts_with_all = "&[ \"password_interactive\", \"password_filename\" ]")
+	)]
+	pub password: Option<String>,
+
+	/// File that contains the password used by the keystore.
+	#[structopt(
+		long = "password-filename",
+		value_name = "PATH",
+		parse(from_os_str),
+		raw(conflicts_with_all = "&[ \"password_interactive\", \"password\" ]")
+	)]
+	pub password_filename: Option<PathBuf>
 }
 
 /// Stores all required Cli values for a keyring test account.
@@ -410,18 +434,22 @@ struct KeyringTestAccountCliValues {
 	help: String,
 	conflicts_with: Vec<String>,
 	name: String,
-	variant: keyring::AuthorityKeyring,
+	variant: keyring::Sr25519Keyring,
 }
 
 lazy_static::lazy_static! {
 	/// The Cli values for all test accounts.
 	static ref TEST_ACCOUNTS_CLI_VALUES: Vec<KeyringTestAccountCliValues> = {
-		keyring::AuthorityKeyring::iter().map(|a| {
-			let help = format!("Shortcut for `--key //{} --name {}`.", a, a);
-			let conflicts_with = keyring::AuthorityKeyring::iter()
+		keyring::Sr25519Keyring::iter().map(|a| {
+			let help = format!(
+				"Shortcut for `--name {} --validator` with session keys for `{}` added to keystore.",
+				a,
+				a,
+			);
+			let conflicts_with = keyring::Sr25519Keyring::iter()
 				.filter(|b| a != *b)
 				.map(|b| b.to_string().to_lowercase())
-				.chain(["name", "key"].iter().map(|s| s.to_string()))
+				.chain(std::iter::once("name".to_string()))
 				.collect::<Vec<_>>();
 			let name = a.to_string().to_lowercase();
 
@@ -438,7 +466,7 @@ lazy_static::lazy_static! {
 /// Wrapper for exposing the keyring test accounts into the Cli.
 #[derive(Debug, Clone)]
 pub struct Keyring {
-	pub account: Option<keyring::AuthorityKeyring>,
+	pub account: Option<keyring::Sr25519Keyring>,
 }
 
 impl StructOpt for Keyring {
@@ -589,6 +617,18 @@ pub struct ImportBlocksCmd {
 	#[allow(missing_docs)]
 	#[structopt(flatten)]
 	pub shared_params: SharedParams,
+
+	/// The means of execution used when calling into the runtime while importing blocks.
+	#[structopt(
+		long = "execution",
+		value_name = "STRATEGY",
+		raw(
+			possible_values = "&ExecutionStrategy::variants()",
+			case_insensitive = "true",
+			default_value = r#""NativeElseWasm""#
+		)
+	)]
+	pub execution: ExecutionStrategy,
 }
 
 impl_get_log_filter!(ImportBlocksCmd);

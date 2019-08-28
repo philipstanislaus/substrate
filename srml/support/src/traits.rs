@@ -18,18 +18,44 @@
 //!
 //! NOTE: If you're looking for `parameter_types`, it has moved in to the top-level module.
 
-use crate::rstd::result;
+use crate::rstd::{prelude::*, result, marker::PhantomData, ops::Div};
 use crate::codec::{Codec, Encode, Decode};
-use crate::runtime_primitives::traits::{
-	MaybeSerializeDebug, SimpleArithmetic
-};
+use primitives::u32_trait::Value as U32;
+use crate::sr_primitives::traits::{MaybeSerializeDebug, SimpleArithmetic, Saturating};
+use crate::sr_primitives::ConsensusEngineId;
 
 use super::for_each_tuple;
+
+/// A trait that can return the default value of a storage item. This must only ever be implemented
+/// for a special delegator struct for each storage item
+pub trait StorageDefault<V>: Sized {
+	/// Return the default value of type `V`. `None`, if `V` does not have a proper default value.
+	fn default() -> Option<V>;
+}
+
+// FIXME #1466 This is needed for `storage_items!`. Should be removed once it is deprecated.
+impl<T: Default> StorageDefault<T> for () { fn default() -> Option<T> { Some(Default::default()) } }
+
+/// Anything that can have a `::len()` method.
+pub trait Len {
+	/// Return the length of data type.
+	fn len(&self) -> usize;
+}
+
+impl<T: IntoIterator + Clone,> Len for T where <T as IntoIterator>::IntoIter: ExactSizeIterator {
+	fn len(&self) -> usize {
+		self.clone().into_iter().len()
+	}
+}
 
 /// A trait for querying a single fixed value from a type.
 pub trait Get<T> {
 	/// Return a constant value.
 	fn get() -> T;
+}
+
+impl<T: Default> Get<T> for () {
+	fn get() -> T { T::default() }
 }
 
 /// A trait for querying whether a type can be said to statically "contain" a value. Similar
@@ -89,17 +115,49 @@ pub enum UpdateBalanceOutcome {
 	AccountKilled,
 }
 
-/// Simple trait designed for hooking into a transaction payment.
-///
-/// It operates over a single generic `AccountId` type.
-pub trait MakePayment<AccountId> {
-	/// Make transaction payment from `who` for an extrinsic of encoded length
-	/// `encoded_len` bytes. Return `Ok` iff the payment was successful.
-	fn make_payment(who: &AccountId, encoded_len: usize) -> Result<(), &'static str>;
+/// A trait for finding the author of a block header based on the `PreRuntime` digests contained
+/// within it.
+pub trait FindAuthor<Author> {
+	/// Find the author of a block based on the pre-runtime digests.
+	fn find_author<'a, I>(digests: I) -> Option<Author>
+		where I: 'a + IntoIterator<Item=(ConsensusEngineId, &'a [u8])>;
 }
 
-impl<T> MakePayment<T> for () {
-	fn make_payment(_: &T, _: usize) -> Result<(), &'static str> { Ok(()) }
+impl<A> FindAuthor<A> for () {
+	fn find_author<'a, I>(_: I) -> Option<A>
+		where I: 'a + IntoIterator<Item=(ConsensusEngineId, &'a [u8])>
+	{
+		None
+	}
+}
+
+/// A trait for verifying the seal of a header and returning the author.
+pub trait VerifySeal<Header, Author> {
+	/// Verify a header and return the author, if any.
+	fn verify_seal(header: &Header) -> Result<Option<Author>, &'static str>;
+}
+
+/// Something which can compute and check proofs of
+/// a historical key owner and return full identification data of that
+/// key owner.
+pub trait KeyOwnerProofSystem<Key> {
+	/// The proof of membership itself.
+	type Proof: Codec;
+	/// The full identification of a key owner and the stash account.
+	type IdentificationTuple: Codec;
+
+	/// Prove membership of a key owner in the current block-state.
+	///
+	/// This should typically only be called off-chain, since it may be
+	/// computationally heavy.
+	///
+	/// Returns `Some` iff the key owner referred to by the given `key` is a
+	/// member of the current set.
+	fn prove(key: Key) -> Option<Self::Proof>;
+
+	/// Check a proof of membership on-chain. Return `Some` iff the proof is
+	/// valid and recent enough to check.
+	fn check_proof(key: Key, proof: Self::Proof) -> Option<Self::IdentificationTuple>;
 }
 
 /// Handler for when some currency "account" decreased in balance for
@@ -255,6 +313,34 @@ impl<
 	}
 }
 
+/// Split an unbalanced amount two ways between a common divisor.
+pub struct SplitTwoWays<
+	Balance,
+	Imbalance,
+	Part1,
+	Target1,
+	Part2,
+	Target2,
+>(PhantomData<(Balance, Imbalance, Part1, Target1, Part2, Target2)>);
+
+impl<
+	Balance: From<u32> + Saturating + Div<Output=Balance>,
+	I: Imbalance<Balance>,
+	Part1: U32,
+	Target1: OnUnbalanced<I>,
+	Part2: U32,
+	Target2: OnUnbalanced<I>,
+> OnUnbalanced<I> for SplitTwoWays<Balance, I, Part1, Target1, Part2, Target2>
+{
+	fn on_unbalanced(amount: I) {
+		let total: u32 = Part1::VALUE + Part2::VALUE;
+		let amount1 = amount.peek().saturating_mul(Part1::VALUE.into()) / total.into();
+		let (imb1, imb2) = amount.split(amount1);
+		Target1::on_unbalanced(imb1);
+		Target2::on_unbalanced(imb2);
+	}
+}
+
 /// Abstraction over a fungible assets system.
 pub trait Currency<AccountId> {
 	/// The balance of an account.
@@ -283,6 +369,21 @@ pub trait Currency<AccountId> {
 	/// The minimum balance any single account may have. This is equivalent to the `Balances` module's
 	/// `ExistentialDeposit`.
 	fn minimum_balance() -> Self::Balance;
+
+	/// Reduce the total issuance by `amount` and return the according imbalance. The imbalance will
+	/// typically be used to reduce an account by the same amount with e.g. `settle`.
+	///
+	/// This is infallible, but doesn't guarantee that the entire `amount` is burnt, for example
+	/// in the case of underflow.
+	fn burn(amount: Self::Balance) -> Self::PositiveImbalance;
+
+	/// Increase the total issuance by `amount` and return the according imbalance. The imbalance
+	/// will typically be used to increase an account by the same amount with e.g.
+	/// `resolve_into_existing` or `resolve_creating`.
+	///
+	/// This is infallible, but doesn't guarantee that the entire `amount` is issued, for example
+	/// in the case of overflow.
+	fn issue(amount: Self::Balance) -> Self::NegativeImbalance;
 
 	/// The 'free' balance of a given account.
 	///
@@ -340,17 +441,18 @@ pub trait Currency<AccountId> {
 		value: Self::Balance
 	) -> result::Result<Self::PositiveImbalance, &'static str>;
 
-	/// Removes some free balance from `who` account for `reason` if possible. If `liveness` is `KeepAlive`,
-	/// then no less than `ExistentialDeposit` must be left remaining.
-	///
-	/// This checks any locks, vesting, and liquidity requirements. If the removal is not possible, then it
-	/// returns `Err`.
-	fn withdraw(
+	/// Similar to deposit_creating, only accepts a `NegativeImbalance` and returns nothing on
+	/// success.
+	fn resolve_into_existing(
 		who: &AccountId,
-		value: Self::Balance,
-		reason: WithdrawReason,
-		liveness: ExistenceRequirement,
-	) -> result::Result<Self::NegativeImbalance, &'static str>;
+		value: Self::NegativeImbalance,
+	) -> result::Result<(), Self::NegativeImbalance> {
+		let v = value.peek();
+		match Self::deposit_into_existing(who, v) {
+			Ok(opposite) => Ok(drop(value.offset(opposite))),
+			_ => Err(value),
+		}
+	}
 
 	/// Adds up to `value` to the free balance of `who`. If `who` doesn't exist, it is created.
 	///
@@ -359,6 +461,45 @@ pub trait Currency<AccountId> {
 		who: &AccountId,
 		value: Self::Balance,
 	) -> Self::PositiveImbalance;
+
+	/// Similar to deposit_creating, only accepts a `NegativeImbalance` and returns nothing on
+	/// success.
+	fn resolve_creating(
+		who: &AccountId,
+		value: Self::NegativeImbalance,
+	) {
+		let v = value.peek();
+		drop(value.offset(Self::deposit_creating(who, v)));
+	}
+
+	/// Removes some free balance from `who` account for `reason` if possible. If `liveness` is
+	/// `KeepAlive`, then no less than `ExistentialDeposit` must be left remaining.
+	///
+	/// This checks any locks, vesting, and liquidity requirements. If the removal is not possible,
+	/// then it returns `Err`.
+	///
+	/// If the operation is successful, this will return `Ok` with a `NegativeImbalance` whose value
+	/// is `value`.
+	fn withdraw(
+		who: &AccountId,
+		value: Self::Balance,
+		reason: WithdrawReason,
+		liveness: ExistenceRequirement,
+	) -> result::Result<Self::NegativeImbalance, &'static str>;
+
+	/// Similar to withdraw, only accepts a `PositiveImbalance` and returns nothing on success.
+	fn settle(
+		who: &AccountId,
+		value: Self::PositiveImbalance,
+		reason: WithdrawReason,
+		liveness: ExistenceRequirement,
+	) -> result::Result<(), Self::PositiveImbalance> {
+		let v = value.peek();
+		match Self::withdraw(who, v, reason, liveness) {
+			Ok(opposite) => Ok(drop(value.offset(opposite))),
+			_ => Err(value),
+		}
+	}
 
 	/// Ensure an account's free balance equals some value; this will create the account
 	/// if needed.
@@ -500,3 +641,87 @@ bitmask! {
 	}
 }
 
+pub trait Time {
+	type Moment: SimpleArithmetic + Codec + Clone + Default + Copy;
+
+	fn now() -> Self::Moment;
+}
+
+impl WithdrawReasons {
+	/// Choose all variants except for `one`.
+	pub fn except(one: WithdrawReason) -> WithdrawReasons {
+		let mut mask = Self::all();
+		mask.toggle(one);
+		mask
+	}
+}
+
+/// Trait for type that can handle incremental changes to a set of account IDs.
+pub trait ChangeMembers<AccountId: Clone + Ord> {
+	/// A number of members `incoming` just joined the set and replaced some `outgoing` ones. The
+	/// new set is given by `new`, and need not be sorted.
+	fn change_members(incoming: &[AccountId], outgoing: &[AccountId], mut new: Vec<AccountId>) {
+		new.sort_unstable();
+		Self::change_members_sorted(incoming, outgoing, &new[..]);
+	}
+
+	/// A number of members `_incoming` just joined the set and replaced some `_outgoing` ones. The
+	/// new set is thus given by `sorted_new` and **must be sorted**.
+	///
+	/// NOTE: This is the only function that needs to be implemented in `ChangeMembers`.
+	fn change_members_sorted(
+		incoming: &[AccountId],
+		outgoing: &[AccountId],
+		sorted_new: &[AccountId],
+	);
+
+	/// Set the new members; they **must already be sorted**. This will compute the diff and use it to
+	/// call `change_members_sorted`.
+	fn set_members_sorted(new_members: &[AccountId], old_members: &[AccountId]) {
+		let mut old_iter = old_members.iter();
+		let mut new_iter = new_members.iter();
+		let mut incoming = Vec::new();
+		let mut outgoing = Vec::new();
+		let mut old_i = old_iter.next();
+		let mut new_i = new_iter.next();
+		loop {
+			match (old_i, new_i) {
+				(None, None) => break,
+				(Some(old), Some(new)) if old == new => {
+					old_i = old_iter.next();
+					new_i = new_iter.next();
+				}
+				(Some(old), Some(new)) if old < new => {
+					outgoing.push(old.clone());
+					old_i = old_iter.next();
+				}
+				(Some(old), None) => {
+					outgoing.push(old.clone());
+					old_i = old_iter.next();
+				}
+				(_, Some(new)) => {
+					incoming.push(new.clone());
+					new_i = new_iter.next();
+				}
+			}
+		}
+
+		Self::change_members_sorted(&incoming[..], &outgoing[..], &new_members);
+	}
+}
+
+impl<T: Clone + Ord> ChangeMembers<T> for () {
+	fn change_members(_: &[T], _: &[T], _: Vec<T>) {}
+	fn change_members_sorted(_: &[T], _: &[T], _: &[T]) {}
+	fn set_members_sorted(_: &[T], _: &[T]) {}
+}
+
+/// Trait for type that can handle the initialization of account IDs at genesis.
+pub trait InitializeMembers<AccountId> {
+	/// Initialize the members to the given `members`.
+	fn initialize_members(members: &[AccountId]);
+}
+
+impl<T> InitializeMembers<T> for () {
+	fn initialize_members(_: &[T]) {}
+}

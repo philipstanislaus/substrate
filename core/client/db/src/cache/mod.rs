@@ -23,9 +23,9 @@ use kvdb::{KeyValueDB, DBTransaction};
 
 use client::blockchain::Cache as BlockchainCache;
 use client::error::Result as ClientResult;
-use parity_codec::{Encode, Decode};
-use runtime_primitives::generic::BlockId;
-use runtime_primitives::traits::{Block as BlockT, Header as HeaderT, NumberFor, Zero};
+use codec::{Encode, Decode};
+use sr_primitives::generic::BlockId;
+use sr_primitives::traits::{Block as BlockT, Header as HeaderT, NumberFor, Zero};
 use consensus_common::well_known_cache_keys::Id as CacheKeyId;
 use crate::utils::{self, COLUMN_META, db_err};
 
@@ -221,7 +221,7 @@ impl<'a, Block: BlockT> DbCacheTransaction<'a, Block> {
 				),
 				parent.clone(),
 				block.clone(),
-				value.or(cache.value_at_block(&parent)?),
+				value,
 				entry_type,
 			)?;
 			if let Some(op) = op {
@@ -294,9 +294,13 @@ impl<Block: BlockT> BlockchainCache<Block> for DbCacheSync<Block> {
 		Ok(())
 	}
 
-	fn get_at(&self, key: &CacheKeyId, at: &BlockId<Block>) -> Option<Vec<u8>> {
-		let cache = self.0.read();
-		let storage = cache.cache_at.get(key)?.storage();
+	fn get_at(
+		&self,
+		key: &CacheKeyId,
+		at: &BlockId<Block>,
+	) -> Option<((NumberFor<Block>, Block::Hash), Option<(NumberFor<Block>, Block::Hash)>, Vec<u8>)> {
+		let mut cache = self.0.write();
+		let storage = cache.get_cache(*key).storage();
 		let db = storage.db();
 		let columns = storage.columns();
 		let at = match *at {
@@ -318,7 +322,16 @@ impl<Block: BlockT> BlockchainCache<Block> for DbCacheSync<Block> {
 			},
 		};
 
-		cache.cache_at.get(key)?.value_at_block(&at).ok()?
+		cache.cache_at
+			.get(key)?
+			.value_at_block(&at)
+			.map(|block_and_value| block_and_value.map(|(begin_block, end_block, value)|
+				(
+					(begin_block.number, begin_block.hash),
+					end_block.map(|end_block| (end_block.number, end_block.hash)),
+					value,
+				)))
+			.ok()?
 	}
 }
 

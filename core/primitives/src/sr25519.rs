@@ -22,7 +22,7 @@
 // end::description[]
 
 #[cfg(feature = "std")]
-use schnorrkel::{signing_context, Keypair, SecretKey, MiniSecretKey, PublicKey,
+use schnorrkel::{signing_context, ExpansionMode, Keypair, SecretKey, MiniSecretKey, PublicKey,
 	derive::{Derivation, ChainCode, CHAIN_CODE_LENGTH}
 };
 #[cfg(feature = "std")]
@@ -30,14 +30,17 @@ use substrate_bip39::mini_secret_from_entropy;
 #[cfg(feature = "std")]
 use bip39::{Mnemonic, Language, MnemonicType};
 #[cfg(feature = "std")]
-use crate::crypto::{Pair as TraitPair, DeriveJunction, Infallible, SecretStringError, Derive, Ss58Codec};
-use crate::{hash::{H256, H512}, crypto::UncheckedFrom};
-use parity_codec::{Encode, Decode};
+use crate::crypto::{
+	Pair as TraitPair, DeriveJunction, Infallible, SecretStringError, Ss58Codec
+};
+use crate::{crypto::{Public as TraitPublic, UncheckedFrom, CryptoType, Derive}};
+use crate::hash::{H256, H512};
+use codec::{Encode, Decode};
 
 #[cfg(feature = "std")]
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 #[cfg(feature = "std")]
-use schnorrkel::keys::MINI_SECRET_KEY_LENGTH;
+use schnorrkel::keys::{MINI_SECRET_KEY_LENGTH, SECRET_KEY_LENGTH};
 
 // signing context
 #[cfg(feature = "std")]
@@ -51,9 +54,14 @@ pub struct Public(pub [u8; 32]);
 #[cfg(feature = "std")]
 pub struct Pair(Keypair);
 
-impl AsRef<Public> for Public {
-	fn as_ref(&self) -> &Public {
-		&self
+#[cfg(feature = "std")]
+impl Clone for Pair {
+	fn clone(&self) -> Self {
+		Pair(schnorrkel::Keypair {
+			public: self.0.public,
+			secret: schnorrkel::SecretKey::from_bytes(&self.0.secret.to_bytes()[..])
+				.expect("key is always the correct size; qed")
+		})
 	}
 }
 
@@ -87,6 +95,20 @@ impl From<Public> for H256 {
 	}
 }
 
+impl rstd::convert::TryFrom<&[u8]> for Public {
+	type Error = ();
+
+	fn try_from(data: &[u8]) -> Result<Self, Self::Error> {
+		if data.len() == 32 {
+			let mut inner = [0u8; 32];
+			inner.copy_from_slice(data);
+			Ok(Public(inner))
+		} else {
+			Err(())
+		}
+	}
+}
+
 impl UncheckedFrom<[u8; 32]> for Public {
 	fn unchecked_from(x: [u8; 32]) -> Self {
 		Public::from_raw(x)
@@ -100,15 +122,15 @@ impl UncheckedFrom<H256> for Public {
 }
 
 #[cfg(feature = "std")]
-impl ::std::fmt::Display for Public {
-	fn fmt(&self, f: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
+impl std::fmt::Display for Public {
+	fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
 		write!(f, "{}", self.to_ss58check())
 	}
 }
 
 #[cfg(feature = "std")]
-impl ::std::fmt::Debug for Public {
-	fn fmt(&self, f: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
+impl std::fmt::Debug for Public {
+	fn fmt(&self, f: &mut std::fmt::Formatter) -> ::std::fmt::Result {
 		let s = self.to_ss58check();
 		write!(f, "{} ({}...)", crate::hexdisplay::HexDisplay::from(&self.0), &s[0..8])
 	}
@@ -130,8 +152,8 @@ impl<'de> Deserialize<'de> for Public {
 }
 
 #[cfg(feature = "std")]
-impl ::std::hash::Hash for Public {
-	fn hash<H: ::std::hash::Hasher>(&self, state: &mut H) {
+impl std::hash::Hash for Public {
+	fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
 		self.0.hash(state);
 	}
 }
@@ -141,6 +163,20 @@ impl ::std::hash::Hash for Public {
 /// Instead of importing it for the local module, alias it to be available as a public type
 #[derive(Encode, Decode)]
 pub struct Signature(pub [u8; 64]);
+
+impl rstd::convert::TryFrom<&[u8]> for Signature {
+	type Error = ();
+
+	fn try_from(data: &[u8]) -> Result<Self, Self::Error> {
+		if data.len() == 64 {
+			let mut inner = [0u8; 64];
+			inner.copy_from_slice(data);
+			Ok(Signature(inner))
+		} else {
+			Err(())
+		}
+	}
+}
 
 impl Clone for Signature {
 	fn clone(&self) -> Self {
@@ -158,7 +194,7 @@ impl Default for Signature {
 
 impl PartialEq for Signature {
 	fn eq(&self, b: &Self) -> bool {
-		&self.0[..] == &b.0[..]
+		self.0[..] == b.0[..]
 	}
 }
 
@@ -256,11 +292,11 @@ impl Signature {
 	}
 }
 
-#[cfg(feature = "std")]
 impl Derive for Public {
 	/// Derive a child key from a series of given junctions.
 	///
 	/// `None` if there are any hard junctions in there.
+	#[cfg(feature = "std")]
 	fn derive<Iter: Iterator<Item=DeriveJunction>>(&self, path: Iter) -> Option<Public> {
 		let mut acc = PublicKey::from_bytes(self.as_ref()).ok()?;
 		for j in path {
@@ -282,16 +318,6 @@ impl Public {
 		Public(data)
 	}
 
-	/// A new instance from the given slice that should be 32 bytes long.
-	///
-	/// NOTE: No checking goes on to ensure this is a real public key. Only use it if
-	/// you are certain that the array actually is a pubkey. GIGO!
-	pub fn from_slice(data: &[u8]) -> Self {
-		let mut r = [0u8; 32];
-		r.copy_from_slice(data);
-		Public(r)
-	}
-
 	/// A new instance from an H256.
 	///
 	/// NOTE: No checking goes on to ensure this is a real public key. Only use it if
@@ -300,34 +326,28 @@ impl Public {
 		Public(x.into())
 	}
 
-	/// Return a `Vec<u8>` filled with raw data.
-	#[cfg(feature = "std")]
-	pub fn into_raw_vec(self) -> Vec<u8> {
-		self.0.to_vec()
-	}
-
-	/// Return a slice filled with raw data.
-	pub fn as_slice(&self) -> &[u8] {
-		&self.0
-	}
-
 	/// Return a slice filled with raw data.
 	pub fn as_array_ref(&self) -> &[u8; 32] {
 		self.as_ref()
 	}
 }
 
-#[cfg(feature = "std")]
-impl AsRef<Pair> for Pair {
-	fn as_ref(&self) -> &Pair {
-		&self
+impl TraitPublic for Public {
+	/// A new instance from the given slice that should be 32 bytes long.
+	///
+	/// NOTE: No checking goes on to ensure this is a real public key. Only use it if
+	/// you are certain that the array actually is a pubkey. GIGO!
+	fn from_slice(data: &[u8]) -> Self {
+		let mut r = [0u8; 32];
+		r.copy_from_slice(data);
+		Public(r)
 	}
 }
 
 #[cfg(feature = "std")]
 impl From<MiniSecretKey> for Pair {
 	fn from(sec: MiniSecretKey) -> Pair {
-		Pair(sec.expand_to_keypair())
+		Pair(sec.expand_to_keypair(ExpansionMode::Ed25519))
 	}
 }
 
@@ -362,9 +382,10 @@ impl AsRef<schnorrkel::Keypair> for Pair {
 /// Derive a single hard junction.
 #[cfg(feature = "std")]
 fn derive_hard_junction(secret: &SecretKey, cc: &[u8; CHAIN_CODE_LENGTH]) -> SecretKey {
-	secret.hard_derive_mini_secret_key(Some(ChainCode(cc.clone())), b"").0.expand()
+	secret.hard_derive_mini_secret_key(Some(ChainCode(cc.clone())), b"").0.expand(ExpansionMode::Ed25519)
 }
 
+/// The raw secret seed, which can be used to recreate the `Pair`.
 #[cfg(feature = "std")]
 type Seed = [u8; MINI_SECRET_KEY_LENGTH];
 
@@ -397,14 +418,22 @@ impl TraitPair for Pair {
 	///
 	/// You should never need to use this; generate(), generate_with_phrase(), from_phrase()
 	fn from_seed_slice(seed: &[u8]) -> Result<Pair, SecretStringError> {
-		if seed.len() != MINI_SECRET_KEY_LENGTH {
-			Err(SecretStringError::InvalidSeedLength)
-		} else {
-			Ok(Pair(
-				MiniSecretKey::from_bytes(seed)
-					.map_err(|_| SecretStringError::InvalidSeed)?
-					.expand_to_keypair()
-			))
+		match seed.len() {
+			MINI_SECRET_KEY_LENGTH => {
+				Ok(Pair(
+					MiniSecretKey::from_bytes(seed)
+						.map_err(|_| SecretStringError::InvalidSeed)?
+						.expand_to_keypair(ExpansionMode::Ed25519)
+				))
+			}
+			SECRET_KEY_LENGTH => {
+				Ok(Pair(
+					SecretKey::from_bytes(seed)
+						.map_err(|_| SecretStringError::InvalidSeed)?
+						.to_keypair()
+				))
+			}
+			_ => Err(SecretStringError::InvalidSeedLength)
 		}
 	}
 
@@ -452,31 +481,26 @@ impl TraitPair for Pair {
 	}
 
 	/// Verify a signature on a message. Returns true if the signature is good.
-	fn verify<P: AsRef<Self::Public>, M: AsRef<[u8]>>(sig: &Self::Signature, message: M, pubkey: P) -> bool {
-		let signature: schnorrkel::Signature = match schnorrkel::Signature::from_bytes(&sig.as_ref()) {
-			Ok(some_signature) => some_signature,
-			Err(_) => return false
-		};
-		match PublicKey::from_bytes(pubkey.as_ref().as_slice()) {
-			Ok(pk) => pk.verify(
-				signing_context(SIGNING_CTX).bytes(message.as_ref()), &signature
-			),
-			Err(_) => false,
-		}
+	fn verify<M: AsRef<[u8]>>(sig: &Self::Signature, message: M, pubkey: &Self::Public) -> bool {
+		Self::verify_weak(&sig.0[..], message, pubkey)
 	}
 
 	/// Verify a signature on a message. Returns true if the signature is good.
 	fn verify_weak<P: AsRef<[u8]>, M: AsRef<[u8]>>(sig: &[u8], message: M, pubkey: P) -> bool {
-		let signature: schnorrkel::Signature = match schnorrkel::Signature::from_bytes(sig) {
-			Ok(some_signature) => some_signature,
-			Err(_) => return false
-		};
+		// Match both schnorrkel 0.1.1 and 0.8.0+ signatures, supporting both wallets
+		// that have not been upgraded and those that have. To swap to 0.8.0 only,
+		// create `schnorrkel::Signature` and pass that into `verify_simple`
 		match PublicKey::from_bytes(pubkey.as_ref()) {
-			Ok(pk) => pk.verify(
-				signing_context(SIGNING_CTX).bytes(message.as_ref()), &signature
-			),
+			Ok(pk) => pk.verify_simple_preaudit_deprecated(
+				SIGNING_CTX, message.as_ref(), &sig,
+			).is_ok(),
 			Err(_) => false,
 		}
+	}
+
+	/// Return a vec filled with raw data.
+	fn to_raw_vec(&self) -> Vec<u8> {
+		self.0.secret.to_bytes().to_vec()
 	}
 }
 
@@ -490,8 +514,60 @@ impl Pair {
 		let mini_key: MiniSecretKey = mini_secret_from_entropy(entropy, password.unwrap_or(""))
 			.expect("32 bytes can always build a key; qed");
 
-		let kp = mini_key.expand_to_keypair();
+		let kp = mini_key.expand_to_keypair(ExpansionMode::Ed25519);
 		(Pair(kp), mini_key.to_bytes())
+	}
+}
+
+impl CryptoType for Public {
+	#[cfg(feature="std")]
+	type Pair = Pair;
+}
+
+impl CryptoType for Signature {
+	#[cfg(feature="std")]
+	type Pair = Pair;
+}
+
+#[cfg(feature = "std")]
+impl CryptoType for Pair {
+	type Pair = Pair;
+}
+
+#[cfg(test)]
+mod compatibility_test {
+	use super::*;
+	use crate::crypto::{DEV_PHRASE};
+	use hex_literal::hex;
+
+	// NOTE: tests to ensure addresses that are created with the `0.1.x` version (pre-audit) are
+	// still functional.
+
+	#[test]
+	fn derive_soft_known_pair_should_work() {
+		let pair = Pair::from_string(&format!("{}/Alice", DEV_PHRASE), None).unwrap();
+		// known address of DEV_PHRASE with 1.1
+		let known = hex!("d6c71059dbbe9ad2b0ed3f289738b800836eb425544ce694825285b958ca755e");
+		assert_eq!(pair.public().to_raw_vec(), known);
+	}
+
+	#[test]
+	fn derive_hard_known_pair_should_work() {
+		let pair = Pair::from_string(&format!("{}//Alice", DEV_PHRASE), None).unwrap();
+		// known address of DEV_PHRASE with 1.1
+		let known = hex!("d43593c715fdd31c61141abd04a99fd6822c8558854ccde39a5684e7a56da27d");
+		assert_eq!(pair.public().to_raw_vec(), known);
+	}
+
+	#[test]
+	fn verify_known_message_should_work() {
+		let public = Public::from_raw(hex!("b4bfa1f7a5166695eb75299fd1c4c03ea212871c342f2c5dfea0902b2c246918"));
+		// signature generated by the 1.1 version with the same ^^ public key.
+		let signature = Signature::from_raw(hex!(
+			"5a9755f069939f45d96aaf125cf5ce7ba1db998686f87f2fb3cbdea922078741a73891ba265f70c31436e18a9acd14d189d73c12317ab6c313285cd938453202"
+		));
+		let message = b"Verifying that I am the owner of 5G9hQLdsKQswNPgB499DeA5PkFBbgkLPJWkkS6FAM6xGQ8xD. Hash: 221455a3\n";
+		assert!(Pair::verify(&signature, &message[..], &public));
 	}
 }
 
@@ -605,7 +681,6 @@ mod test {
 
 	#[test]
 	fn seeded_pair_should_work() {
-
 		let pair = Pair::from_seed(b"12345678901234567890123456789012");
 		let public = pair.public();
 		assert_eq!(
@@ -638,9 +713,9 @@ mod test {
 			&hex!("0000000000000000000000000000000000000000000000000000000000000000")
 		);
 		let public = pk.public();
-		let js_signature = Signature::from_raw(
-			hex!("28a854d54903e056f89581c691c1f7d2ff39f8f896c9e9c22475e60902cc2b3547199e0e91fa32902028f2ca2355e8cdd16cfe19ba5e8b658c94aa80f3b81a00")
-		);
-		assert!(Pair::verify(&js_signature, b"SUBSTRATE", public));
+		let js_signature = Signature::from_raw(hex!(
+			"28a854d54903e056f89581c691c1f7d2ff39f8f896c9e9c22475e60902cc2b3547199e0e91fa32902028f2ca2355e8cdd16cfe19ba5e8b658c94aa80f3b81a00"
+		));
+		assert!(Pair::verify(&js_signature, b"SUBSTRATE", &public));
 	}
 }

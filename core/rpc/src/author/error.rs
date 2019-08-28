@@ -19,7 +19,6 @@
 use client;
 use transaction_pool::txpool;
 use crate::rpc;
-
 use crate::errors;
 
 /// Author RPC Result type.
@@ -36,8 +35,20 @@ pub enum Error {
 	#[display(fmt="Extrinsic verification error: {}", _0)]
 	Verification(Box<dyn std::error::Error + Send>),
 	/// Incorrect extrinsic format.
-	#[display(fmt="Invalid extrinsic format")]
-	BadFormat,
+	#[display(fmt="Invalid extrinsic format: {}", _0)]
+	BadFormat(codec::Error),
+	/// Incorrect seed phrase.
+	#[display(fmt="Invalid seed phrase/SURI")]
+	BadSeedPhrase,
+	/// Key type ID has an unknown format.
+	#[display(fmt="Invalid key type ID format (should be of length four)")]
+	BadKeyType,
+	/// Key type ID has some unsupported crypto.
+	#[display(fmt="The crypto of key type ID is unknown")]
+	UnsupportedKeyType,
+	/// Some random issue with the key store. Shouldn't happen.
+	#[display(fmt="The key store is unavailable")]
+	KeyStoreUnavailable,
 }
 
 impl std::error::Error for Error {
@@ -72,15 +83,17 @@ const POOL_TOO_LOW_PRIORITY: i64 = POOL_INVALID_TX + 4;
 const POOL_CYCLE_DETECTED: i64 = POOL_INVALID_TX + 5;
 /// The transaction was not included to the pool because of the limits.
 const POOL_IMMEDIATELY_DROPPED: i64 = POOL_INVALID_TX + 6;
+/// The key type crypto is not known.
+const UNSUPPORTED_KEY_TYPE: i64 = POOL_INVALID_TX + 7;
 
 impl From<Error> for rpc::Error {
 	fn from(e: Error) -> Self {
 		use txpool::error::{Error as PoolError};
 
 		match e {
-			Error::BadFormat => rpc::Error {
+			Error::BadFormat(e) => rpc::Error {
 				code: rpc::ErrorCode::ServerError(BAD_FORMAT),
-				message: "Extrinsic has invalid format.".into(),
+				message: format!("Extrinsic has invalid format: {}", e).into(),
 				data: None,
 			},
 			Error::Verification(e) => rpc::Error {
@@ -122,6 +135,14 @@ impl From<Error> for rpc::Error {
 				code: rpc::ErrorCode::ServerError(POOL_IMMEDIATELY_DROPPED),
 				message: "Immediately Dropped" .into(),
 				data: Some("The transaction couldn't enter the pool because of the limit".into()),
+			},
+			Error::UnsupportedKeyType => rpc::Error {
+				code: rpc::ErrorCode::ServerError(UNSUPPORTED_KEY_TYPE),
+				message: "Unknown key type crypto" .into(),
+				data: Some(
+					"The crypto for the given key type is unknown, please add the public key to the \
+					request to insert the key successfully.".into()
+				),
 			},
 			e => errors::internal(e),
 		}

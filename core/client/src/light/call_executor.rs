@@ -21,12 +21,11 @@ use std::{
 	collections::HashSet, sync::Arc, panic::UnwindSafe, result,
 	marker::PhantomData, cell::RefCell, rc::Rc,
 };
-use futures::{IntoFuture, Future};
 
-use parity_codec::{Encode, Decode};
+use codec::{Encode, Decode};
 use primitives::{offchain, H256, Blake2Hasher, convert_hash, NativeOrEncoded};
-use runtime_primitives::generic::BlockId;
-use runtime_primitives::traits::{One, Block as BlockT, Header as HeaderT};
+use sr_primitives::generic::BlockId;
+use sr_primitives::traits::{One, Block as BlockT, Header as HeaderT};
 use state_machine::{
 	self, Backend as StateBackend, CodeExecutor, OverlayedChanges,
 	ExecutionStrategy, create_proof_check_backend,
@@ -95,18 +94,18 @@ where
 		call_data: &[u8],
 		_strategy: ExecutionStrategy,
 		_side_effects_handler: Option<&mut O>,
-	)
-		-> ClientResult<Vec<u8>> {
+	) -> ClientResult<Vec<u8>>
+	{
 		let block_hash = self.blockchain.expect_block_hash_from_id(id)?;
 		let block_header = self.blockchain.expect_header(id.clone())?;
 
-		self.fetcher.remote_call(RemoteCallRequest {
+		futures::executor::block_on(self.fetcher.remote_call(RemoteCallRequest {
 			block: block_hash,
 			header: block_header,
 			method: method.into(),
 			call_data: call_data.to_vec(),
 			retry_count: None,
-		}).into_future().wait()
+		}))
 	}
 
 	fn contextual_call<
@@ -131,6 +130,7 @@ where
 		_native_call: Option<NC>,
 		side_effects_handler: Option<&mut O>,
 		_recorder: &Option<Rc<RefCell<ProofRecorder<Block>>>>,
+		_enable_keystore: bool,
 	) -> ClientResult<NativeOrEncoded<R>> where ExecutionManager<EM>: Clone {
 		let block_initialized = match initialize_block {
 			InitializeBlock::Do(ref init_block) => {
@@ -144,13 +144,25 @@ where
 			return Err(ClientError::NotAvailableOnLightClient.into());
 		}
 
-		self.call(at, method, call_data, (&execution_manager).into(), side_effects_handler).map(NativeOrEncoded::Encoded)
+		self.call(
+			at,
+			method,
+			call_data,
+			(&execution_manager).into(),
+			side_effects_handler,
+		).map(NativeOrEncoded::Encoded)
 	}
 
 	fn runtime_version(&self, id: &BlockId<Block>) -> ClientResult<RuntimeVersion> {
-		let call_result = self.call(id, "Core_version", &[], ExecutionStrategy::NativeElseWasm, NeverOffchainExt::new())?;
+		let call_result = self.call(
+			id,
+			"Core_version",
+			&[],
+			ExecutionStrategy::NativeElseWasm,
+			NeverOffchainExt::new()
+		)?;
 		RuntimeVersion::decode(&mut call_result.as_slice())
-			.ok_or_else(|| ClientError::VersionInvalid.into())
+			.map_err(|_| ClientError::VersionInvalid.into())
 	}
 
 	fn call_at_state<
@@ -170,7 +182,11 @@ where
 		_m: ExecutionManager<FF>,
 		_native_call: Option<NC>,
 		_side_effects_handler: Option<&mut O>,
-	) -> ClientResult<(NativeOrEncoded<R>, S::Transaction, Option<MemoryDB<Blake2Hasher>>)> {
+	) -> ClientResult<(
+		NativeOrEncoded<R>,
+		(S::Transaction, <Blake2Hasher as Hasher>::Out),
+		Option<MemoryDB<Blake2Hasher>>,
+	)> {
 		Err(ClientError::NotAvailableOnLightClient.into())
 	}
 
@@ -267,6 +283,7 @@ impl<Block, B, Remote, Local> CallExecutor<Block, Blake2Hasher> for
 		native_call: Option<NC>,
 		side_effects_handler: Option<&mut O>,
 		recorder: &Option<Rc<RefCell<ProofRecorder<Block>>>>,
+		enable_keystore: bool,
 	) -> ClientResult<NativeOrEncoded<R>> where ExecutionManager<EM>: Clone {
 		// there's no actual way/need to specify native/wasm execution strategy on light node
 		// => we can safely ignore passed values
@@ -293,6 +310,7 @@ impl<Block, B, Remote, Local> CallExecutor<Block, Blake2Hasher> for
 				native_call,
 				side_effects_handler,
 				recorder,
+				enable_keystore,
 			).map_err(|e| ClientError::Execution(Box::new(e.to_string()))),
 			false => CallExecutor::contextual_call::<
 				_,
@@ -315,6 +333,7 @@ impl<Block, B, Remote, Local> CallExecutor<Block, Blake2Hasher> for
 				native_call,
 				side_effects_handler,
 				recorder,
+				enable_keystore,
 			).map_err(|e| ClientError::Execution(Box::new(e.to_string()))),
 		}
 	}
@@ -343,7 +362,11 @@ impl<Block, B, Remote, Local> CallExecutor<Block, Blake2Hasher> for
 		_manager: ExecutionManager<FF>,
 		native_call: Option<NC>,
 		side_effects_handler: Option<&mut O>,
-	) -> ClientResult<(NativeOrEncoded<R>, S::Transaction, Option<MemoryDB<Blake2Hasher>>)> {
+	) -> ClientResult<(
+		NativeOrEncoded<R>,
+		(S::Transaction, <Blake2Hasher as Hasher>::Out),
+		Option<MemoryDB<Blake2Hasher>>,
+	)> {
 		// there's no actual way/need to specify native/wasm execution strategy on light node
 		// => we can safely ignore passed values
 
@@ -448,7 +471,7 @@ pub fn check_execution_proof<Header, E, H>(
 		Default::default(),
 		Default::default(),
 		request.header.hash(),
-		request.header.digest().clone(),
+		Default::default(),
 	);
 	execution_proof_check_on_trie_backend::<H, _>(
 		&trie_backend,
@@ -456,6 +479,7 @@ pub fn check_execution_proof<Header, E, H>(
 		executor,
 		"Core_initialize_block",
 		&next_block.encode(),
+		None,
 	)?;
 
 	// execute method
@@ -465,6 +489,7 @@ pub fn check_execution_proof<Header, E, H>(
 		executor,
 		&request.method,
 		&request.call_data,
+		None,
 	)?;
 
 	Ok(local_result)
@@ -473,8 +498,8 @@ pub fn check_execution_proof<Header, E, H>(
 #[cfg(test)]
 mod tests {
 	use consensus::BlockOrigin;
-	use test_client::{self, runtime::Header, ClientExt, TestClient};
-	use executor::NativeExecutionDispatch;
+	use test_client::{self, runtime::{Header, Digest}, ClientExt, TestClient};
+	use executor::NativeExecutor;
 	use crate::backend::{Backend, NewBlockState};
 	use crate::in_mem::Backend as InMemBackend;
 	use crate::light::fetcher::tests::OkCallFetcher;
@@ -484,8 +509,7 @@ mod tests {
 	fn execution_proof_is_generated_and_checked() {
 		fn execute(remote_client: &TestClient, at: u64, method: &'static str) -> (Vec<u8>, Vec<u8>) {
 			let remote_block_id = BlockId::Number(at);
-			let remote_root = remote_client.state_at(&remote_block_id)
-				.unwrap().storage_root(::std::iter::empty()).0;
+			let remote_header = remote_client.header(&remote_block_id).unwrap().unwrap();
 
 			// 'fetch' execution proof from remote node
 			let (remote_result, remote_execution_proof) = remote_client.execution_proof(
@@ -495,16 +519,10 @@ mod tests {
 			).unwrap();
 
 			// check remote execution proof locally
-			let local_executor = test_client::LocalExecutor::new(None);
+			let local_executor = NativeExecutor::<test_client::LocalExecutor>::new(None);
 			let local_result = check_execution_proof(&local_executor, &RemoteCallRequest {
 				block: test_client::runtime::Hash::default(),
-				header: test_client::runtime::Header {
-					state_root: remote_root.into(),
-					parent_hash: Default::default(),
-					number: at,
-					extrinsics_root: Default::default(),
-					digest: Default::default(),
-				},
+				header: remote_header,
 				method: method.into(),
 				call_data: vec![],
 				retry_count: None,
@@ -515,10 +533,12 @@ mod tests {
 
 		// prepare remote client
 		let remote_client = test_client::new();
-		for _ in 1..3 {
+		for i in 1u32..3u32 {
+			let mut digest = Digest::default();
+			digest.push(sr_primitives::generic::DigestItem::Other::<H256>(i.to_le_bytes().to_vec()));
 			remote_client.import_justified(
 				BlockOrigin::Own,
-				remote_client.new_block(Default::default()).unwrap().bake().unwrap(),
+				remote_client.new_block(digest).unwrap().bake().unwrap(),
 				Default::default(),
 			).unwrap();
 		}

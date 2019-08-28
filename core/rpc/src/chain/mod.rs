@@ -23,6 +23,7 @@ pub mod number;
 mod tests;
 
 use std::sync::Arc;
+use futures03::{future, StreamExt as _, TryStreamExt as _};
 
 use client::{self, Client, BlockchainEvents};
 use crate::rpc::Result as RpcResult;
@@ -32,8 +33,8 @@ use jsonrpc_derive::rpc;
 use jsonrpc_pubsub::{typed::Subscriber, SubscriptionId};
 use log::warn;
 use primitives::{H256, Blake2Hasher};
-use runtime_primitives::generic::{BlockId, SignedBlock};
-use runtime_primitives::traits::{Block as BlockT, Header, NumberFor};
+use sr_primitives::generic::{BlockId, SignedBlock};
+use sr_primitives::traits::{Block as BlockT, Header, NumberFor};
 use self::error::Result;
 
 pub use self::gen_client::Client as ChainClient;
@@ -66,19 +67,19 @@ pub trait ChainApi<Number, Hash, Header, SignedBlock> {
 	#[pubsub(
 		subscription = "chain_newHead",
 		subscribe,
-		name = "chain_subscribeNewHead",
-		alias("subscribe_newHead")
+		name = "chain_subscribeNewHeads",
+		alias("subscribe_newHead", "chain_subscribeNewHead")
 	)]
-	fn subscribe_new_head(&self, metadata: Self::Metadata, subscriber: Subscriber<Header>);
+	fn subscribe_new_heads(&self, metadata: Self::Metadata, subscriber: Subscriber<Header>);
 
 	/// Unsubscribe from new head subscription.
 	#[pubsub(
 		subscription = "chain_newHead",
 		unsubscribe,
-		name = "chain_unsubscribeNewHead",
-		alias("unsubscribe_newHead")
+		name = "chain_unsubscribeNewHeads",
+		alias("unsubscribe_newHead", "chain_unsubscribeNewHead")
 	)]
-	fn unsubscribe_new_head(&self, metadata: Option<Self::Metadata>, id: SubscriptionId) -> RpcResult<bool>;
+	fn unsubscribe_new_heads(&self, metadata: Option<Self::Metadata>, id: SubscriptionId) -> RpcResult<bool>;
 
 	/// New head subscription
 	#[pubsub(
@@ -198,17 +199,18 @@ impl<B, E, Block, RA> ChainApi<NumberFor<Block>, Block::Hash, Block::Header, Sig
 		Ok(self.client.info().chain.finalized_hash)
 	}
 
-	fn subscribe_new_head(&self, _metadata: Self::Metadata, subscriber: Subscriber<Block::Header>) {
+	fn subscribe_new_heads(&self, _metadata: Self::Metadata, subscriber: Subscriber<Block::Header>) {
 		self.subscribe_headers(
 			subscriber,
 			|| self.block_hash(None.into()),
 			|| self.client.import_notification_stream()
-				.filter(|notification| notification.is_new_best)
-				.map(|notification| notification.header),
+				.filter(|notification| future::ready(notification.is_new_best))
+				.map(|notification| Ok::<_, ()>(notification.header))
+				.compat(),
 		)
 	}
 
-	fn unsubscribe_new_head(&self, _metadata: Option<Self::Metadata>, id: SubscriptionId) -> RpcResult<bool> {
+	fn unsubscribe_new_heads(&self, _metadata: Option<Self::Metadata>, id: SubscriptionId) -> RpcResult<bool> {
 		Ok(self.subscriptions.cancel(id))
 	}
 
@@ -217,7 +219,8 @@ impl<B, E, Block, RA> ChainApi<NumberFor<Block>, Block::Hash, Block::Header, Sig
 			subscriber,
 			|| Ok(Some(self.client.info().chain.finalized_hash)),
 			|| self.client.finality_notification_stream()
-				.map(|notification| notification.header),
+				.map(|notification| Ok::<_, ()>(notification.header))
+				.compat(),
 		)
 	}
 

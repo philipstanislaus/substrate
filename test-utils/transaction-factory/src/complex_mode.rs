@@ -41,27 +41,30 @@
 use std::sync::Arc;
 
 use log::info;
+use client::Client;
 use client::block_builder::api::BlockBuilder;
 use client::runtime_api::ConstructRuntimeApi;
+use primitives::{Blake2Hasher, Hasher};
 use sr_primitives::generic::BlockId;
 use sr_primitives::traits::{Block as BlockT, ProvideRuntimeApi, One, Zero};
-use substrate_service::{
-	FactoryBlock, FullClient, ServiceFactory, ComponentClient, FullComponents
-};
 
 use crate::{RuntimeAdapter, create_block};
 
-pub fn next<F, RA>(
+pub fn next<RA, Backend, Exec, Block, RtApi>(
 	factory_state: &mut RA,
-	client: &Arc<ComponentClient<FullComponents<F>>>,
+	client: &Arc<Client<Backend, Exec, Block, RtApi>>,
+	version: u32,
+	genesis_hash: <RA::Block as BlockT>::Hash,
 	prior_block_hash: <RA::Block as BlockT>::Hash,
-	prior_block_id: BlockId<F::Block>,
-) -> Option<<F as ServiceFactory>::Block>
+	prior_block_id: BlockId<Block>,
+) -> Option<Block>
 where
-	F: ServiceFactory,
-	F::RuntimeApi: ConstructRuntimeApi<FactoryBlock<F>, FullClient<F>>,
-	FullClient<F>: ProvideRuntimeApi,
-	<FullClient<F> as ProvideRuntimeApi>::Api: BlockBuilder<FactoryBlock<F>>,
+	Block: BlockT<Hash = <Blake2Hasher as Hasher>::Out>,
+	Exec: client::CallExecutor<Block, Blake2Hasher> + Send + Sync + Clone,
+	Backend: client::backend::Backend<Block, Blake2Hasher> + Send,
+	Client<Backend, Exec, Block, RtApi>: ProvideRuntimeApi,
+	<Client<Backend, Exec, Block, RtApi> as ProvideRuntimeApi>::Api: BlockBuilder<Block>,
+	RtApi: ConstructRuntimeApi<Block, Client<Backend, Exec, Block, RtApi>> + Send + Sync,
 	RA: RuntimeAdapter,
 {
 	let total = factory_state.start_number() + factory_state.num() * factory_state.rounds();
@@ -83,19 +86,16 @@ where
 	let seed = factory_state.start_number() + factory_state.block_no();
 	let to = RA::gen_random_account_id(&seed);
 
-	let amount;
-	if factory_state.round() == RA::Number::zero() {
-		amount = RA::minimum_balance() * factory_state.rounds();
-	} else {
-		let rounds_left = factory_state.rounds() - factory_state.round();
-		amount = RA::minimum_balance() * rounds_left;
-	};
+	let rounds_left = factory_state.rounds() - factory_state.round();
+	let amount = RA::minimum_balance() * rounds_left.into();
 
 	let transfer = factory_state.transfer_extrinsic(
 		&from.0,
 		&from.1,
 		&to,
 		&amount,
+		version,
+		&genesis_hash,
 		&prior_block_hash,
 	);
 
@@ -103,7 +103,7 @@ where
 	let inherents = client.runtime_api().inherent_extrinsics(&prior_block_id, inherents)
 		.expect("Failed to create inherent extrinsics");
 
-	let block = create_block::<F, RA>(&client, transfer, inherents);
+	let block = create_block::<RA, _, _, _, _>(&client, transfer, inherents);
 	info!(
 		"Created block {} with hash {}. Transferring {} from {} to {}.",
 		factory_state.block_no() + RA::Number::one(),

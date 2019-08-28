@@ -253,9 +253,15 @@
 // Ensure we're `no_std` when compiling for Wasm.
 #![cfg_attr(not(feature = "std"), no_std)]
 
+use rstd::marker::PhantomData;
 use srml_support::{StorageValue, dispatch::Result, decl_module, decl_storage, decl_event};
-use system::ensure_signed;
-use sr_primitives::weights::TransactionWeight;
+use system::{ensure_signed, ensure_root};
+use codec::{Encode, Decode};
+use sr_primitives::{
+	traits::{SignedExtension, DispatchError, Bounded},
+	transaction_validity::ValidTransaction,
+	weights::{SimpleDispatchInfo, DispatchInfo},
+};
 
 /// Our module's configuration trait. All our types and consts go in here. If the
 /// module is dependent on specific other modules, then their configuration traits
@@ -396,19 +402,18 @@ decl_module! {
 		//
 		// If you don't respect these rules, it is likely that your chain will be attackable.
 		//
-		// Each transaction can optionally indicate a weight. The weight is passed in as a
-		// custom attribute and the value can be anything that implements the `Weighable`
-		// trait. Most often using substrate's default `TransactionWeight` is enough for you.
+		// Each transaction can define an optional `#[weight]` attribute to convey a set of static
+		// information about its dispatch. The `system` and `executive` module then use this
+		// information to properly execute the transaction, whilst keeping the total load of the
+		// chain in a moderate rate.
 		//
-		// A basic weight is a tuple of `(base_weight, byte_weight)`. Upon including each transaction
-		// in a block, the final weight is calculated as `base_weight + byte_weight * tx_size`.
-		// If this value, added to the weight of all included transactions, exceeds `MAX_TRANSACTION_WEIGHT`,
-		// the transaction is not included. If no weight attribute is provided, the `::default()`
-		// implementation of `TransactionWeight` is used.
-		//
-		// The example below showcases a transaction which is relatively costly, but less dependent on
-		// the input, hence `byte_weight` is configured smaller.
-		#[weight = TransactionWeight::Basic(100_000, 10)]
+		// The _right-hand-side_ value of the `#[weight]` attribute can be any type that implements
+		// a set of traits, namely [`WeighData`] and [`ClassifyDispatch`]. The former conveys the
+		// weight (a numeric representation of pure execution time and difficulty) of the
+		// transaction and the latter demonstrates the `DispatchClass` of the call. A higher weight
+		//  means a larger transaction (less of which can be placed in a single block). See the
+		// `CheckWeight` signed extension struct in the `system` module for more information.
+		#[weight = SimpleDispatchInfo::FixedNormal(10_000)]
 		fn accumulate_dummy(origin, increase_by: T::Balance) -> Result {
 			// This is a public call, so we ensure that the origin is some signed account.
 			let _sender = ensure_signed(origin)?;
@@ -440,7 +445,7 @@ decl_module! {
 		}
 
 		/// A privileged call; in this case it resets our dummy value to something new.
-		// Implementation of a privileged call. This doesn't have an `origin` parameter because
+		// Implementation of a privileged call. The `origin` parameter is ROOT because
 		// it's not (directly) from an extrinsic, but rather the system as a whole has decided
 		// to execute it. Different runtimes have different reasons for allow privileged
 		// calls to be executed - we don't need to care why. Because it's privileged, we can
@@ -448,7 +453,8 @@ decl_module! {
 		// without worrying about gameability or attack scenarios.
 		// If you not specify `Result` explicitly as return value, it will be added automatically
 		// for you and `Ok(())` will be returned.
-		fn set_dummy(#[compact] new_value: T::Balance) {
+		fn set_dummy(origin, #[compact] new_value: T::Balance) {
+			ensure_root(origin)?;
 			// Put the new value into storage.
 			<Dummy<T>>::put(new_value);
 		}
@@ -500,18 +506,98 @@ impl<T: Trait> Module<T> {
 	}
 }
 
+// Similar to other SRML modules, your module can also define a signed extension and perform some
+// checks and [pre/post]processing [before/after] the transaction. A signed extension can be any
+// decodable type that implements `SignedExtension`. See the trait definition for the full list of
+// bounds. As a convention, you can follow this approach to create an extension for your module:
+//   - If the extension does not carry any data, then use a tuple struct with just a `marker`
+//     (needed for the compiler to accept `T: Trait`) will suffice.
+//   - Otherwise, create a tuple struct which contains the external data. Of course, for the entire
+//     struct to be decodable, each individual item also needs to be decodable.
+//
+// Note that a signed extension can also indicate that a particular data must be present in the
+// _signing payload_ of a transaction by providing an implementation for the `additional_signed`
+// method. This example will not cover this type of extension. See `CheckRuntime` in system module
+// for an example.
+//
+// Using the extension, you can add some hooks to the lifecycle of each transaction. Note that by
+// default, an extension is applied to all `Call` functions (i.e. all transactions). the `Call` enum
+// variant is given to each function of `SignedExtension`. Hence, you can filter based on module or
+// a particular call if needed.
+//
+// Some extra information, such as encoded length, some static dispatch info like weight and the
+// sender of the transaction (if signed) are also provided.
+//
+// The full list of hooks that can be added to a signed extension can be found
+// [here](https://crates.parity.io/sr_primitives/traits/trait.SignedExtension.html).
+//
+// The signed extensions are aggregated in the runtime file of a substrate chain. All extensions
+// should be aggregated in a tuple and passed to the `CheckedExtrinsic` and `UncheckedExtrinsic`
+// types defined in the runtime. Lookup `pub type SignedExtra = (...)` in `node/runtime` and
+// `node-template` for an example of this.
+
+/// A simple signed extension that checks for the `set_dummy` call. In that case, it increases the
+/// priority and prints some log.
+///
+/// Additionally, it drops any transaction with an encoded length higher than 200 bytes. No
+/// particular reason why, just to demonstrate the power of signed extensions.
+#[derive(Encode, Decode, Clone, Eq, PartialEq)]
+pub struct WatchDummy<T: Trait + Send + Sync>(PhantomData<T>);
+
+#[cfg(feature = "std")]
+impl<T: Trait + Send + Sync> rstd::fmt::Debug for WatchDummy<T> {
+	fn fmt(&self, f: &mut rstd::fmt::Formatter) -> rstd::fmt::Result {
+		write!(f, "WatchDummy<T>")
+	}
+}
+
+impl<T: Trait + Send + Sync> SignedExtension for WatchDummy<T> {
+	type AccountId = T::AccountId;
+	// Note that this could also be assigned to the top-level call enum. It is passed into the
+	// balances module directly and since `Trait: balances::Trait`, you could also use `T::Call`.
+	// In that case, you would have had access to all call variants and could match on variants from
+	// other modules.
+	type Call = Call<T>;
+	type AdditionalSigned = ();
+	type Pre = ();
+
+	fn additional_signed(&self) -> rstd::result::Result<(), &'static str> { Ok(()) }
+
+	fn validate(
+		&self,
+		_who: &Self::AccountId,
+		call: &Self::Call,
+		_info: DispatchInfo,
+		len: usize,
+	) -> rstd::result::Result<ValidTransaction, DispatchError> {
+		// if the transaction is too big, just drop it.
+		if len > 200 { return Err(DispatchError::Exhausted) }
+
+		// check for `set_dummy`
+		match call {
+			Call::set_dummy(..) => {
+				rio::print("set_dummy was received.");
+
+				let mut valid_tx = ValidTransaction::default();
+				valid_tx.priority = Bounded::max_value();
+				Ok(valid_tx)
+			}
+			_ => Ok(Default::default())
+		}
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
 
-	use srml_support::{impl_outer_origin, assert_ok};
-	use sr_io::with_externalities;
-	use substrate_primitives::{H256, Blake2Hasher};
+	use srml_support::{assert_ok, impl_outer_origin, parameter_types};
+	use rio::with_externalities;
+	use primitives::{H256, Blake2Hasher};
 	// The testing primitives are very useful for avoiding having to work with signatures
-	// or public keys. `u64` is used as the `AccountId` and no `Signature`s are requried.
+	// or public keys. `u64` is used as the `AccountId` and no `Signature`s are required.
 	use sr_primitives::{
-		BuildStorage, traits::{BlakeTwo256, OnInitialize, OnFinalize, IdentityLookup},
-		testing::Header
+		Perbill, traits::{BlakeTwo256, OnInitialize, OnFinalize, IdentityLookup}, testing::Header
 	};
 
 	impl_outer_origin! {
@@ -523,16 +609,36 @@ mod tests {
 	// configuration traits of modules we want to use.
 	#[derive(Clone, Eq, PartialEq)]
 	pub struct Test;
+	parameter_types! {
+		pub const BlockHashCount: u64 = 250;
+		pub const MaximumBlockWeight: u32 = 1024;
+		pub const MaximumBlockLength: u32 = 2 * 1024;
+		pub const AvailableBlockRatio: Perbill = Perbill::one();
+	}
 	impl system::Trait for Test {
 		type Origin = Origin;
 		type Index = u64;
 		type BlockNumber = u64;
 		type Hash = H256;
+		type Call = ();
 		type Hashing = BlakeTwo256;
 		type AccountId = u64;
 		type Lookup = IdentityLookup<Self::AccountId>;
 		type Header = Header;
+		type WeightMultiplierUpdate = ();
 		type Event = ();
+		type BlockHashCount = BlockHashCount;
+		type MaximumBlockWeight = MaximumBlockWeight;
+		type MaximumBlockLength = MaximumBlockLength;
+		type AvailableBlockRatio = AvailableBlockRatio;
+		type Version = ();
+	}
+	parameter_types! {
+		pub const ExistentialDeposit: u64 = 0;
+		pub const TransferFee: u64 = 0;
+		pub const CreationFee: u64 = 0;
+		pub const TransactionBaseFee: u64 = 0;
+		pub const TransactionByteFee: u64 = 0;
 	}
 	impl balances::Trait for Test {
 		type Balance = u64;
@@ -542,6 +648,12 @@ mod tests {
 		type TransactionPayment = ();
 		type TransferPayment = ();
 		type DustRemoval = ();
+		type ExistentialDeposit = ExistentialDeposit;
+		type TransferFee = TransferFee;
+		type CreationFee = CreationFee;
+		type TransactionBaseFee = TransactionBaseFee;
+		type TransactionByteFee = TransactionByteFee;
+		type WeightToFee = ();
 	}
 	impl Trait for Test {
 		type Event = ();
@@ -550,16 +662,16 @@ mod tests {
 
 	// This function basically just builds a genesis storage key/value store according to
 	// our desired mockup.
-	fn new_test_ext() -> sr_io::TestExternalities<Blake2Hasher> {
-		let mut t = system::GenesisConfig::<Test>::default().build_storage().unwrap().0;
+	fn new_test_ext() -> rio::TestExternalities<Blake2Hasher> {
+		let mut t = system::GenesisConfig::default().build_storage::<Test>().unwrap();
 		// We use default for brevity, but you can configure as desired if needed.
-		t.extend(balances::GenesisConfig::<Test>::default().build_storage().unwrap().0);
-		t.extend(GenesisConfig::<Test>{
+		balances::GenesisConfig::<Test>::default().assimilate_storage(&mut t).unwrap();
+		GenesisConfig::<Test>{
 			dummy: 42,
 			// we configure the map with (key, value) pairs.
 			bar: vec![(1, 2), (2, 3)],
 			foo: 24,
-		}.build_storage().unwrap().0);
+		}.assimilate_storage(&mut t).unwrap();
 		t.into()
 	}
 
@@ -591,5 +703,22 @@ mod tests {
 			assert_ok!(Example::accumulate_foo(Origin::signed(1), 1));
 			assert_eq!(Example::foo(), 25);
 		});
+	}
+
+	#[test]
+	fn signed_ext_watch_dummy_works() {
+		with_externalities(&mut new_test_ext(), || {
+			let call = <Call<Test>>::set_dummy(10);
+			let info = DispatchInfo::default();
+
+			assert_eq!(
+				WatchDummy::<Test>(PhantomData).validate(&1, &call, info, 150).unwrap().priority,
+				Bounded::max_value()
+			);
+			assert_eq!(
+				WatchDummy::<Test>(PhantomData).validate(&1, &call, info, 250),
+				Err(DispatchError::Exhausted)
+			);
+		})
 	}
 }

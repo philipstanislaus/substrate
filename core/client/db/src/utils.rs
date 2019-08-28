@@ -17,7 +17,9 @@
 //! Db-based backend utility structures and functions, used by both
 //! full and light storages.
 
-use std::{io, convert::TryInto, sync::Arc};
+#[cfg(feature = "kvdb-rocksdb")]
+use std::sync::Arc;
+use std::{io, convert::TryInto};
 
 use kvdb::{KeyValueDB, DBTransaction};
 #[cfg(feature = "kvdb-rocksdb")]
@@ -25,18 +27,19 @@ use kvdb_rocksdb::{Database, DatabaseConfig};
 use log::debug;
 
 use client;
-use parity_codec::Decode;
+use codec::Decode;
 use trie::DBValue;
-use runtime_primitives::generic::BlockId;
-use runtime_primitives::traits::{
-	Block as BlockT, Header as HeaderT, Zero, UniqueSaturatedFrom,
-	UniqueSaturatedInto, CheckedConversion
+use sr_primitives::generic::BlockId;
+use sr_primitives::traits::{
+	Block as BlockT, Header as HeaderT, Zero,
+	UniqueSaturatedFrom, UniqueSaturatedInto,
 };
+#[cfg(feature = "kvdb-rocksdb")]
 use crate::DatabaseSettings;
 
 /// Number of columns in the db. Must be the same for both full && light dbs.
 /// Otherwise RocksDb will fail to open database && check its type.
-pub const NUM_COLUMNS: u32 = 9;
+pub const NUM_COLUMNS: u32 = 10;
 /// Meta column. The set of keys in the column is shared by full && light storages.
 pub const COLUMN_META: Option<u32> = Some(0);
 
@@ -81,25 +84,31 @@ pub type NumberIndexKey = [u8; 4];
 ///
 /// In the current database schema, this kind of key is only used for
 /// lookups into an index, NOT for storing header data or others.
-pub fn number_index_key<N: TryInto<u32>>(n: N) -> NumberIndexKey {
-	let n = n.checked_into::<u32>().unwrap();
-	[
+pub fn number_index_key<N: TryInto<u32>>(n: N) -> client::error::Result<NumberIndexKey> {
+	let n = n.try_into().map_err(|_|
+		client::error::Error::Backend("Block number cannot be converted to u32".into())
+	)?;
+
+	Ok([
 		(n >> 24) as u8,
 		((n >> 16) & 0xff) as u8,
 		((n >> 8) & 0xff) as u8,
 		(n & 0xff) as u8
-	]
+	])
 }
 
 /// Convert number and hash into long lookup key for blocks that are
 /// not in the canonical chain.
-pub fn number_and_hash_to_lookup_key<N, H>(number: N, hash: H) -> Vec<u8> where
+pub fn number_and_hash_to_lookup_key<N, H>(
+	number: N,
+	hash: H,
+) -> client::error::Result<Vec<u8>>	where
 	N: TryInto<u32>,
-	H: AsRef<[u8]>
+	H: AsRef<[u8]>,
 {
-	let mut lookup_key = number_index_key(number).to_vec();
+	let mut lookup_key = number_index_key(number)?.to_vec();
 	lookup_key.extend_from_slice(hash.as_ref());
-	lookup_key
+	Ok(lookup_key)
 }
 
 /// Convert block lookup key into block number.
@@ -121,8 +130,9 @@ pub fn remove_number_to_key_mapping<N: TryInto<u32>>(
 	transaction: &mut DBTransaction,
 	key_lookup_col: Option<u32>,
 	number: N,
-) {
-	transaction.delete(key_lookup_col, number_index_key(number).as_ref())
+) -> client::error::Result<()> {
+	transaction.delete(key_lookup_col, number_index_key(number)?.as_ref());
+	Ok(())
 }
 
 /// Remove key mappings.
@@ -131,9 +141,10 @@ pub fn remove_key_mappings<N: TryInto<u32>, H: AsRef<[u8]>>(
 	key_lookup_col: Option<u32>,
 	number: N,
 	hash: H,
-) {
-	remove_number_to_key_mapping(transaction, key_lookup_col, number);
+) -> client::error::Result<()> {
+	remove_number_to_key_mapping(transaction, key_lookup_col, number)?;
 	transaction.delete(key_lookup_col, hash.as_ref());
+	Ok(())
 }
 
 /// Place a number mapping into the database. This maps number to current perceived
@@ -143,12 +154,13 @@ pub fn insert_number_to_key_mapping<N: TryInto<u32> + Clone, H: AsRef<[u8]>>(
 	key_lookup_col: Option<u32>,
 	number: N,
 	hash: H,
-) {
+) -> client::error::Result<()> {
 	transaction.put_vec(
 		key_lookup_col,
-		number_index_key(number.clone()).as_ref(),
-		number_and_hash_to_lookup_key(number, hash),
-	)
+		number_index_key(number.clone())?.as_ref(),
+		number_and_hash_to_lookup_key(number, hash)?,
+	);
+	Ok(())
 }
 
 /// Insert a hash to key mapping in the database.
@@ -157,12 +169,13 @@ pub fn insert_hash_to_key_mapping<N: TryInto<u32>, H: AsRef<[u8]> + Clone>(
 	key_lookup_col: Option<u32>,
 	number: N,
 	hash: H,
-) {
+) -> client::error::Result<()> {
 	transaction.put_vec(
 		key_lookup_col,
 		hash.clone().as_ref(),
-		number_and_hash_to_lookup_key(number, hash),
-	)
+		number_and_hash_to_lookup_key(number, hash)?,
+	);
+	Ok(())
 }
 
 /// Convert block id to block lookup key.
@@ -174,12 +187,12 @@ pub fn block_id_to_lookup_key<Block>(
 	id: BlockId<Block>
 ) -> Result<Option<Vec<u8>>, client::error::Error> where
 	Block: BlockT,
-	::runtime_primitives::traits::NumberFor<Block>: UniqueSaturatedFrom<u64> + UniqueSaturatedInto<u64>,
+	::sr_primitives::traits::NumberFor<Block>: UniqueSaturatedFrom<u64> + UniqueSaturatedInto<u64>,
 {
 	let res = match id {
 		BlockId::Number(n) => db.get(
 			key_lookup_col,
-			number_index_key(n).as_ref(),
+			number_index_key(n)?.as_ref(),
 		),
 		BlockId::Hash(h) => db.get(key_lookup_col, h.as_ref()),
 	};
@@ -189,7 +202,6 @@ pub fn block_id_to_lookup_key<Block>(
 
 /// Maps database error to client error
 pub fn db_err(err: io::Error) -> client::error::Error {
-	use std::error::Error;
 	client::error::Error::Backend(format!("{}", err))
 }
 
@@ -248,8 +260,8 @@ pub fn read_header<Block: BlockT>(
 ) -> client::error::Result<Option<Block::Header>> {
 	match read_db(db, col_index, col, id)? {
 		Some(header) => match Block::Header::decode(&mut &header[..]) {
-			Some(header) => Ok(Some(header)),
-			None => return Err(
+			Ok(header) => Ok(Some(header)),
+			Err(_) => return Err(
 				client::error::Error::Backend("Error decoding header".into())
 			),
 		}
@@ -278,8 +290,10 @@ pub fn read_meta<Block>(db: &dyn KeyValueDB, col_meta: Option<u32>, col_header: 
 {
 	let genesis_hash: Block::Hash = match db.get(col_meta, meta_keys::GENESIS_HASH).map_err(db_err)? {
 		Some(h) => match Decode::decode(&mut &h[..]) {
-			Some(h) => h,
-			None => return Err(client::error::Error::Backend("Error decoding genesis hash".into())),
+			Ok(h) => h,
+			Err(err) => return Err(client::error::Error::Backend(
+				format!("Error decoding genesis hash: {}", err)
+			)),
 		},
 		None => return Ok(Meta {
 			best_hash: Default::default(),
@@ -293,7 +307,7 @@ pub fn read_meta<Block>(db: &dyn KeyValueDB, col_meta: Option<u32>, col_header: 
 	let load_meta_block = |desc, key| -> Result<_, client::error::Error> {
 		if let Some(Some(header)) = db.get(col_meta, key).and_then(|id|
 			match id {
-				Some(id) => db.get(col_header, &id).map(|h| h.map(|b| Block::Header::decode(&mut &b[..]))),
+				Some(id) => db.get(col_header, &id).map(|h| h.map(|b| Block::Header::decode(&mut &b[..]).ok())),
 				None => Ok(None),
 			}).map_err(db_err)?
 		{
@@ -315,4 +329,20 @@ pub fn read_meta<Block>(db: &dyn KeyValueDB, col_meta: Option<u32>, col_header: 
 		finalized_number,
 		genesis_hash,
 	})
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use sr_primitives::testing::{Block as RawBlock, ExtrinsicWrapper};
+	type Block = RawBlock<ExtrinsicWrapper<u32>>;
+
+	#[test]
+	fn number_index_key_doesnt_panic() {
+		let id = BlockId::<Block>::Number(72340207214430721);
+		match id {
+			BlockId::Number(n) => number_index_key(n).expect_err("number should overflow u32"),
+			_ => unreachable!(),
+		};
+	}
 }

@@ -20,6 +20,7 @@ use std::{
 	collections::BTreeMap,
 	sync::Arc,
 };
+use client::backend::OffchainStorage;
 use parking_lot::RwLock;
 use primitives::offchain::{
 	self,
@@ -27,8 +28,8 @@ use primitives::offchain::{
 	HttpRequestId as RequestId,
 	HttpRequestStatus as RequestStatus,
 	Timestamp,
-	CryptoKind,
-	CryptoKeyId,
+	StorageKind,
+	OpaqueNetworkState,
 };
 
 /// Pending request.
@@ -61,6 +62,11 @@ pub struct PendingRequest {
 pub struct State {
 	/// A list of pending requests.
 	pub requests: BTreeMap<RequestId, PendingRequest>,
+	expected_requests: BTreeMap<RequestId, PendingRequest>,
+	/// Persistent local storage
+	pub persistent_storage: client::in_mem::OffchainStorage,
+	/// Local storage
+	pub local_storage: client::in_mem::OffchainStorage,
 }
 
 impl State {
@@ -74,7 +80,7 @@ impl State {
 	) {
 		match self.requests.get_mut(&RequestId(id)) {
 			None => {
-				panic!("Missing expected request: {:?}.\n\nAll: {:?}", id, self.requests);
+				panic!("Missing pending request: {:?}.\n\nAll: {:?}", id, self.requests);
 			}
 			Some(req) => {
 				assert_eq!(
@@ -86,34 +92,57 @@ impl State {
 			}
 		}
 	}
+
+	fn fulfill_expected(&mut self, id: u16) {
+		if let Some(mut req) = self.expected_requests.remove(&RequestId(id)) {
+			let response = std::mem::replace(&mut req.response, vec![]);
+			let headers = std::mem::replace(&mut req.response_headers, vec![]);
+			self.fulfill_pending_request(id, req, response, headers);
+		}
+	}
+
+	/// Add expected HTTP request.
+	///
+	/// This method can be used to initialize expected HTTP requests and their responses
+	/// before running the actual code that utilizes them (for instance before calling into runtime).
+	/// Expected request has to be fulfilled before this struct is dropped,
+	/// the `response` and `response_headers` fields will be used to return results to the callers.
+	pub fn expect_request(&mut self, id: u16, expected: PendingRequest) {
+		self.expected_requests.insert(RequestId(id), expected);
+	}
+}
+
+impl Drop for State {
+	fn drop(&mut self) {
+		if !self.expected_requests.is_empty() {
+			panic!("Unfulfilled expected requests: {:?}", self.expected_requests);
+		}
+	}
 }
 
 /// Implementation of offchain externalities used for tests.
 #[derive(Clone, Default, Debug)]
 pub struct TestOffchainExt(pub Arc<RwLock<State>>);
 
+impl TestOffchainExt {
+	/// Create new `TestOffchainExt` and a reference to the internal state.
+	pub fn new() -> (Self, Arc<RwLock<State>>) {
+		let ext = Self::default();
+		let state = ext.0.clone();
+		(ext, state)
+	}
+}
+
 impl offchain::Externalities for TestOffchainExt {
+	fn is_validator(&self) -> bool {
+		unimplemented!("not needed in tests so far")
+	}
+
 	fn submit_transaction(&mut self, _ex: Vec<u8>) -> Result<(), ()> {
 		unimplemented!("not needed in tests so far")
 	}
 
-	fn new_crypto_key(&mut self, _crypto: CryptoKind) -> Result<CryptoKeyId, ()> {
-		unimplemented!("not needed in tests so far")
-	}
-
-	fn encrypt(&mut self, _key: Option<CryptoKeyId>, _data: &[u8]) -> Result<Vec<u8>, ()> {
-		unimplemented!("not needed in tests so far")
-	}
-
-	fn decrypt(&mut self, _key: Option<CryptoKeyId>, _data: &[u8]) -> Result<Vec<u8>, ()> {
-		unimplemented!("not needed in tests so far")
-	}
-
-	fn sign(&mut self, _key: Option<CryptoKeyId>, _data: &[u8]) -> Result<Vec<u8>, ()> {
-		unimplemented!("not needed in tests so far")
-	}
-
-	fn verify(&mut self, _key: Option<CryptoKeyId>, _msg: &[u8], _signature: &[u8]) -> Result<bool, ()> {
+	fn network_state(&self) -> Result<OpaqueNetworkState, ()> {
 		unimplemented!("not needed in tests so far")
 	}
 
@@ -129,21 +158,34 @@ impl offchain::Externalities for TestOffchainExt {
 		unimplemented!("not needed in tests so far")
 	}
 
-	fn local_storage_set(&mut self, _key: &[u8], _value: &[u8]) {
-		unimplemented!("not needed in tests so far")
+	fn local_storage_set(&mut self, kind: StorageKind, key: &[u8], value: &[u8]) {
+		let mut state = self.0.write();
+		match kind {
+			StorageKind::LOCAL => &mut state.local_storage,
+			StorageKind::PERSISTENT => &mut state.persistent_storage,
+		}.set(b"", key, value);
 	}
 
 	fn local_storage_compare_and_set(
 		&mut self,
-		_key: &[u8],
-		_old_value: &[u8],
-		_new_value: &[u8]
-	) {
-		unimplemented!("not needed in tests so far")
+		kind: StorageKind,
+		key: &[u8],
+		old_value: Option<&[u8]>,
+		new_value: &[u8]
+	) -> bool {
+		let mut state = self.0.write();
+		match kind {
+			StorageKind::LOCAL => &mut state.local_storage,
+			StorageKind::PERSISTENT => &mut state.persistent_storage,
+		}.compare_and_set(b"", key, old_value, new_value)
 	}
 
-	fn local_storage_get(&mut self, _key: &[u8]) -> Option<Vec<u8>> {
-		unimplemented!("not needed in tests so far")
+	fn local_storage_get(&mut self, kind: StorageKind, key: &[u8]) -> Option<Vec<u8>> {
+		let state = self.0.read();
+		match kind {
+			StorageKind::LOCAL => &state.local_storage,
+			StorageKind::PERSISTENT => &state.persistent_storage,
+		}.get(b"", key)
 	}
 
 	fn http_request_start(&mut self, method: &str, uri: &str, meta: &[u8]) -> Result<RequestId, ()> {
@@ -180,15 +222,21 @@ impl offchain::Externalities for TestOffchainExt {
 		_deadline: Option<Timestamp>
 	) -> Result<(), HttpError> {
 		let mut state = self.0.write();
-		if let Some(req) = state.requests.get_mut(&request_id) {
+
+		let sent = {
+			let req = state.requests.get_mut(&request_id).ok_or(HttpError::IoError)?;
+			req.body.extend(chunk);
 			if chunk.is_empty() {
 				req.sent = true;
 			}
-			req.body.extend(chunk);
-			Ok(())
-		} else {
-			Err(HttpError::IoError)
+			req.sent
+		};
+
+		if sent {
+			state.fulfill_expected(request_id.0);
 		}
+
+		Ok(())
 	}
 
 	fn http_response_wait(
@@ -200,7 +248,7 @@ impl offchain::Externalities for TestOffchainExt {
 
 		ids.iter().map(|id| match state.requests.get(id) {
 			Some(req) if req.response.is_empty() => RequestStatus::DeadlineReached,
-			None => RequestStatus::Unknown,
+			None => RequestStatus::Invalid,
 			_ => RequestStatus::Finished(200),
 		}).collect()
 	}
@@ -241,4 +289,3 @@ impl offchain::Externalities for TestOffchainExt {
 		}
 	}
 }
-
