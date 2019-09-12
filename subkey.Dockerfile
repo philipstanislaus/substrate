@@ -10,7 +10,7 @@ WORKDIR /substrate
 COPY . /substrate
 
 RUN apt-get update && \
-	apt-get dist-upgrade -y && \
+	# apt-get dist-upgrade -y && \
 	apt-get install -y cmake pkg-config libssl-dev git clang
 
 RUN curl https://sh.rustup.rs -sSf | sh -s -- -y && \
@@ -29,23 +29,13 @@ FROM phusion/baseimage:0.10.2
 LABEL description="This is the 2nd stage: a very small image where we copy the subkey binary."
 ARG PROFILE=release
 
-RUN mv /usr/share/ca* /tmp && \
-	# rm -rf /usr/share/*  && \
-	mv /tmp/ca-certificates /usr/share/ && \
-	mkdir -p /root/.local/share/Polkadot && \
-	ln -s /root/.local/share/Polkadot /data && \
-	useradd -m -u 1000 -U -s /bin/sh -d /substrate substrate
+RUN mkdir -p /root/.local/share/Polkadot && \
+	ln -s /root/.local/share/Polkadot /data
 
 COPY --from=builder /substrate/target/$PROFILE/subkey /usr/local/bin
 
 # checks
 RUN ldd /usr/local/bin/subkey && \
-	/usr/local/bin/subkey --version
-
-# Shrinking
-# RUN rm -rf /usr/lib/python* && \
-# 	rm -rf /usr/bin /usr/sbin /usr/share/man
-
-# USER substrate
+    /usr/local/bin/subkey --version
 
 CMD ["/usr/local/bin/subkey"]
