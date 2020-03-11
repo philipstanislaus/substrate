@@ -809,11 +809,24 @@ mod tests {
 	use pallet_balances::Error as BalancesError;
 
 	fn new_test_ext() -> sp_io::TestExternalities {
-		let mut t = frame_system::GenesisConfig::default().build_storage::<Test>().unwrap();
-		pallet_balances::GenesisConfig::<Test> {
-			balances: vec![(1, 20), (2, 20), (3, 20), (4, 20), (5, 20)],
-		}.assimilate_storage(&mut t).unwrap();
-		t.into()
+		GenesisConfig {
+			pallet_multi_account: Some(pallet_multi_account::GenesisConfig {
+				multi_accounts: vec![
+					(3, 2, vec![4, 5])
+				],
+			}),
+			pallet_balances: Some(pallet_balances::GenesisConfig {
+				balances: vec![(1, 20), (2, 20), (3, 20), (4, 20), (5, 20)],
+			}),
+		}.build_storage().unwrap().into()
+		// let mut t = frame_system::GenesisConfig::default().build_storage::<Test>().unwrap();
+		// pallet_balances::GenesisConfig::<Test> {
+		// 	balances: vec![(1, 20), (2, 20), (3, 20), (4, 20), (5, 20)],
+		// }.assimilate_storage(&mut t).unwrap();
+		// pallet_multi_account::GenesisConfig::<Test> {
+		// 	multi_accounts: vec![(3, 2, vec![4, 5])],
+		// }.assimilate_storage(&mut t).unwrap();
+		// t.into()
 	}
 
 	fn last_event() -> TestEvent {
